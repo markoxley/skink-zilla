@@ -1,0 +1,17 @@
+# Skink Project Manifest (managed by scales)
+
+[package]
+name = "zilla"
+version = "0.1.0"
+author = "mark"
+entry = "zilla.skink"
+description = "Fiber-style web framework for Skink: app/ctx, routing groups, JWT, sessions, authz, rate limiting, CORS, multipart uploads, WebSocket — over std/web"
+license = "Apache-2.0"
+
+[target]
+env = "std"
+no_std = false
+os = "any"
+arch = "any"
+
+[dependencies]

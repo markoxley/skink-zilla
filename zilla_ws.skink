@@ -1,0 +1,258 @@
+// File:    zilla_ws.skink
+// Purpose: WebSocket (RFC 6455) support for skink-zilla. Upgrade()
+//          validates the handshake headers, then hijacks the
+//          connection via ResponseWriter.Hijack — the callback writes
+//          the 101 Switching Protocols response itself and runs a
+//          frame loop. Frames are decoded/encoded with masking
+//          (client→server masked, server→client unmasked), and both
+//          plain-TCP and TLS connections are supported through the
+//          (conn, ssl) pair the server hands to the hijack callback.
+module zilla_ws
+
+import "std/str"
+import "std/errors"
+import "std/net"
+import "std/base64"
+import "std/crypto"
+import "std/libc"
+import "std/web/types"
+import "zilla_ctx"
+
+// TLS I/O externs (same symbols the std/web server uses) — the hijack
+// callback receives the ssl handle for upgraded TLS connections.
+extern fn Skink_tls_read(ssl: int64, buf: string, len: int) -> int
+extern fn Skink_tls_write_all(ssl: int64, buf: string, len: int) -> int
+extern fn Skink_tls_close(ssl: int64)
+
+// Opcodes.
+pub const OP_CONT   = 0
+pub const OP_TEXT   = 1
+pub const OP_BIN    = 2
+pub const OP_CLOSE  = 8
+pub const OP_PING   = 9
+pub const OP_PONG   = 10
+
+const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+// Conn is a live WebSocket connection.
+pub struct Conn {
+    conn: net.Connection
+    ssl:  int64 // 0 = plain TCP
+    // leftover bytes already read by the HTTP server past the request
+    buf:    string
+    bufLen: int
+    bufPos: int
+}
+
+// wsRead reads n bytes, honoring the pre-buffered leftover first.
+fn wsRead(c: *Conn, n: int) -> (string, errors.Error) {
+    out := libc.malloc(n + 1)
+    have := 0
+    // drain leftover buffer
+    if c.bufPos < c.bufLen {
+        take := c.bufLen - c.bufPos
+        if take > n {
+            take = n
+        }
+        libc.memcpy(out, string(int64(c.buf) + int64(c.bufPos)), take)
+        c.bufPos = c.bufPos + take
+        have = take
+    }
+    for have < n {
+        var got int
+        if c.ssl != 0 {
+            got = Skink_tls_read(c.ssl, string(int64(out) + int64(have)), n - have)
+        } else {
+            got = c.conn.Read(string(int64(out) + int64(have)), n - have)
+        }
+        if got <= 0 {
+            libc.free(out)
+            return "", errors.New("ws: connection closed")
+        }
+        have = have + got
+    }
+    out[n] = 0
+    return out, errors.New("")
+}
+
+// wsWrite sends all bytes.
+fn wsWrite(c: *Conn, data: string, n: int) -> errors.Error {
+    if c.ssl != 0 {
+        if Skink_tls_write_all(c.ssl, data, n) != 0 {
+            return errors.New("ws: write failed")
+        }
+        return errors.New("")
+    }
+    // SendAll returns bytes written (or -1) — not an error code.
+    if c.conn.SendAll(data, n) < n {
+        return errors.New("ws: write failed")
+    }
+    return errors.New("")
+}
+
+// Frame is one decoded WebSocket frame.
+pub struct Frame {
+    Op:   int
+    Data: string
+    Len:  int
+    Fin:  bool
+}
+
+// Read reads one complete frame (fragment continuation frames are
+// passed through — callers reassemble if needed).
+pub fn Read(c: *Conn) -> (Frame, errors.Error) {
+    var f Frame
+    hdr, err := wsRead(c, 2)
+    if str.Len(err.message) > 0 {
+        return f, err
+    }
+    f.Fin = (int(hdr[0]) & 0x80) != 0
+    f.Op = int(hdr[0]) & 0x0F
+    masked := (int(hdr[1]) & 0x80) != 0
+    plen := int64(int(hdr[1]) & 0x7F)
+    if plen == 126 {
+        ext, e2 := wsRead(c, 2)
+        if str.Len(e2.message) > 0 {
+            return f, e2
+        }
+        plen = int64((int(ext[0]) << 8) | int(ext[1]))
+    } else if plen == 127 {
+        ext, e2 := wsRead(c, 8)
+        if str.Len(e2.message) > 0 {
+            return f, e2
+        }
+        plen = int64(0)
+        for i := 0; i < 8; i = i + 1 {
+            plen = (plen << 8) | int64(int(ext[i]))
+        }
+    }
+    var mask string
+    if masked {
+        m, e3 := wsRead(c, 4)
+        if str.Len(e3.message) > 0 {
+            return f, e3
+        }
+        mask = m
+    } else {
+        // RFC 6455 §5.3: a server MUST close on an unmasked client
+        // frame — accepting one is a protocol violation.
+        return f, errors.New("ws: unmasked client frame")
+    }
+    // A 64-bit length with the MSB set decodes negative — check both
+    // sides before it ever reaches an allocation.
+    if plen < int64(0) || plen > int64(64 * 1024 * 1024) {
+        return f, errors.New("ws: frame too large")
+    }
+    if plen > int64(0) {
+        data, e4 := wsRead(c, int(plen))
+        if str.Len(e4.message) > 0 {
+            return f, e4
+        }
+        if masked {
+            for i := 0; i < int(plen); i = i + 1 {
+                data[i] = data[i] ^ mask[i % 4]
+            }
+        }
+        f.Data = data
+        f.Len = int(plen)
+    }
+    return f, errors.New("")
+}
+
+// Write sends one frame (server frames are unmasked).
+pub fn Write(c: *Conn, op: int, data: string, n: int) -> errors.Error {
+    hlen := 2
+    if n >= 126 && n < 65536 {
+        hlen = 4
+    } else if n >= 65536 {
+        hlen = 10
+    }
+    out := libc.malloc(hlen + n)
+    out[0] = 0x80 | op
+    if n < 126 {
+        out[1] = n
+    } else if n < 65536 {
+        out[1] = 126
+        out[2] = n >> 8
+        out[3] = n & 255
+    } else {
+        out[1] = 127
+        i64n := int64(n)
+        for i := 0; i < 8; i = i + 1 {
+            out[2 + i] = int(i64n >> int64((7 - i) * 8)) & 255
+        }
+    }
+    if n > 0 {
+        libc.memcpy(string(int64(out) + int64(hlen)), data, n)
+    }
+    err := wsWrite(c, out, hlen + n)
+    libc.free(out)
+    return err
+}
+
+// WriteText sends a text frame.
+pub fn WriteText(c: *Conn, msg: string) -> errors.Error {
+    return Write(c, OP_TEXT, msg, str.Len(msg))
+}
+
+// WriteBinary sends a binary frame with explicit length.
+pub fn WriteBinary(c: *Conn, data: string, n: int) -> errors.Error {
+    return Write(c, OP_BIN, data, n)
+}
+
+// Ping sends a ping.
+pub fn Ping(c: *Conn) -> errors.Error {
+    return Write(c, OP_PING, "", 0)
+}
+
+// Pong sends a pong (reply to a ping payload).
+pub fn Pong(c: *Conn, data: string, n: int) -> errors.Error {
+    return Write(c, OP_PONG, data, n)
+}
+
+// Close sends a close frame and releases the connection.
+pub fn Close(c: *Conn) {
+    Write(c, OP_CLOSE, "", 0)
+    if c.ssl != 0 {
+        Skink_tls_close(c.ssl)
+    }
+    c.conn.Close()
+}
+
+// acceptKey computes Sec-WebSocket-Accept.
+fn acceptKey(key: string) -> string {
+    sha := crypto.Sha1(str.Concat(key, WS_GUID))
+    return base64.Encode(sha, 20)
+}
+
+// Upgrade checks the WebSocket handshake headers, then arranges a
+// connection hijack. `handler` receives a live *Conn once the 101 has
+// been written — it owns the loop from there (call Read, respond,
+// Close when done). Returns the handler's validation error, if any.
+pub fn Upgrade(c: *zilla_ctx.Ctx, handler: fn(*Conn)) -> errors.Error {
+    if !str.Equal(str.ToLower(zilla_ctx.Header(c, "Upgrade")), "websocket") {
+        return errors.New("ws: missing Upgrade header")
+    }
+    key := zilla_ctx.Header(c, "Sec-WebSocket-Key")
+    if str.Len(key) == 0 {
+        return errors.New("ws: missing Sec-WebSocket-Key")
+    }
+    accept := acceptKey(str.Trim(key))
+
+    // The hijack callback writes the 101 and runs the handler.
+    cb := fn(conn: net.Connection, ssl: int64, buffered: string, bufferedLen: int) {
+        resp := str.Concat("HTTP/1.1 101 Switching Protocols\r\n",
+            str.Concat("Upgrade: websocket\r\n",
+            str.Concat("Connection: Upgrade\r\n",
+            str.Concat("Sec-WebSocket-Accept: ", str.Concat(accept, "\r\n\r\n")))))
+        ws := Conn{conn: conn, ssl: ssl, buf: buffered, bufLen: bufferedLen, bufPos: 0}
+        werr := wsWrite(&ws, resp, str.Len(resp))
+        if str.Len(werr.message) > 0 {
+            ws.conn.Close()
+            return
+        }
+        handler(&ws)
+    }
+    c.Res.Hijack(cb)
+    return errors.New("")
+}

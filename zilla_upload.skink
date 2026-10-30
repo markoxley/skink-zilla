@@ -1,0 +1,216 @@
+// File:    zilla_upload.skink
+// Purpose: multipart/form-data parsing for skink-zilla — file uploads.
+//          MultipartForm splits a request body on the boundary into
+//          Parts; each part has a field name, optional filename,
+//          content type, and raw bytes. FormValue returns a text field;
+//          FormFile returns the upload's bytes for saving.
+//
+//          Binary safety: part bodies may contain NUL bytes, so Part
+//          keeps data + explicit length rather than relying on strlen.
+module zilla_upload
+
+import "std/str"
+import "std/errors"
+import "std/libc"
+import "zilla_ctx"
+
+// Part is one parsed multipart section.
+pub struct Part {
+    Name:     string // field name
+    Filename: string // "" for plain form fields
+    CType:    string // content type, "" if absent
+    Data:     string // raw bytes
+    DataLen:  int    // authoritative byte length (Data may hold NULs)
+}
+
+// MultipartForm parses the request body given the Content-Type
+// boundary. Returns parts; err when the content type or body is bad.
+pub fn MultipartForm(c: *zilla_ctx.Ctx) -> ([]Part, errors.Error) {
+    var empty []Part
+    ct := zilla_ctx.Header(c, "Content-Type")
+    bnd := boundaryOf(ct)
+    if str.Len(bnd) == 0 {
+        return empty, errors.New("upload: no multipart boundary")
+    }
+    body, blen := zilla_ctx.BodyBytes(c)
+    return parseParts(body, blen, bnd)
+}
+
+// boundaryOf extracts the boundary= token from a Content-Type header.
+fn boundaryOf(ct: string) -> string {
+    idx := str.IndexOf(ct, "boundary=")
+    if idx < 0 {
+        return ""
+    }
+    b := str.Substr(ct, idx + 9, str.Len(ct) - idx - 9)
+    // The boundary token ends at the next parameter separator or
+    // whitespace — taking it raw would drag trailing params into the
+    // marker and every split would miss.
+    end := str.Len(b)
+    for i := 0; i < end; i = i + 1 {
+        c := b[i]
+        if c == 59 || c == 32 || c == 9 { // ';' ' ' '\t'
+            end = i
+            break
+        }
+    }
+    b = str.Substr(b, 0, end)
+    // strip optional quotes
+    if str.Len(b) >= 2 && b[0] == 34 && b[str.Len(b) - 1] == 34 {
+        b = str.Substr(b, 1, str.Len(b) - 2)
+    }
+    return b
+}
+
+// byteSlice copies n bytes out of s into a fresh NUL-terminated
+// buffer (Substr is strlen-clamped and cannot slice past NULs).
+fn byteSlice(s: string, off: int, n: int) -> string {
+    out := libc.malloc(n + 1)
+    if n > 0 {
+        libc.memcpy(out, string(int64(s) + int64(off)), n)
+    }
+    out[n] = 0
+    return out
+}
+
+// findSub returns the offset of needle inside hay from `from`, or -1.
+// Binary-safe byte scan (no strlen assumptions beyond hay's length).
+fn findSub(hay: string, hayLen: int, needle: string, startAt: int) -> int {
+    nlen := str.Len(needle)
+    if nlen == 0 || hayLen < nlen {
+        return -1
+    }
+    i := startAt
+    for i + nlen <= hayLen {
+        hit := true
+        for j := 0; j < nlen; j = j + 1 {
+            if hay[i + j] != needle[j] {
+                hit = false
+                break
+            }
+        }
+        if hit {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// parseParts splits the body on "--boundary" markers.
+fn parseParts(body: string, blen: int, boundary: string) -> ([]Part, errors.Error) {
+    var parts []Part
+    marker := str.Concat("--", boundary)
+    mlen := str.Len(marker)
+
+    pos := findSub(body, blen, marker, 0)
+    if pos < 0 {
+        return parts, errors.New("upload: boundary not found")
+    }
+    pos = pos + mlen
+
+    for pos < blen {
+        // after marker: "--" = end, "\r\n" = next part
+        if pos + 2 <= blen && body[pos] == 45 && body[pos + 1] == 45 {
+            break
+        }
+        if pos + 2 <= blen && body[pos] == 13 && body[pos + 1] == 10 {
+            pos = pos + 2
+        }
+        // headers end at \r\n\r\n
+        hend := findSub(body, blen, "\r\n\r\n", pos)
+        if hend < 0 {
+            break
+        }
+        head := str.Substr(body, pos, hend - pos)
+        p := Part{}
+        parsePartHeaders(head, &p)
+        // body runs to the next "\r\n--boundary"
+        nb := findSub(body, blen, str.Concat("\r\n", marker), hend + 4)
+        if nb < 0 {
+            // final part: ends at blen (or trailing \r\n)
+            nb = blen
+        }
+        // binary-safe slice: Substr clamps by strlen and would
+        // truncate at the first NUL byte in the payload
+        plen := nb - hend - 4
+        p.Data = byteSlice(body, hend + 4, plen)
+        p.DataLen = plen
+        parts = append(parts, p)
+        pos = nb + 2 + mlen
+    }
+    return parts, errors.New("")
+}
+
+// parsePartHeaders extracts name/filename/content-type from a part's
+// header block.
+fn parsePartHeaders(head: string, p: *Part) {
+    // Content-Disposition: form-data; name="x"; filename="y"
+    cd := headerValue(head, "Content-Disposition")
+    p.Name = kvToken(cd, "name")
+    p.Filename = kvToken(cd, "filename")
+    p.CType = headerValue(head, "Content-Type")
+}
+
+// headerValue returns the value of a header inside a raw header block.
+fn headerValue(head: string, name: string) -> string {
+    needle := str.Concat(name, ":")
+    idx := str.IndexOf(head, needle)
+    if idx < 0 {
+        // headers could be folded differently; try case-insensitive
+        idx = str.IndexOf(str.ToLower(head), str.ToLower(needle))
+        if idx < 0 {
+            return ""
+        }
+    }
+    v := str.Substr(head, idx + str.Len(needle), str.Len(head) - idx - str.Len(needle))
+    nl := str.IndexOf(v, "\r\n")
+    if nl >= 0 {
+        v = str.Substr(v, 0, nl)
+    }
+    return str.Trim(v)
+}
+
+// kvToken extracts `key="value"` from a ; -separated header value.
+fn kvToken(v: string, key: string) -> string {
+    needle := str.Concat(key, "=\"")
+    idx := str.IndexOf(v, needle)
+    if idx < 0 {
+        return ""
+    }
+    rest := str.Substr(v, idx + str.Len(needle), str.Len(v) - idx - str.Len(needle))
+    q := str.IndexOf(rest, "\"")
+    if q < 0 {
+        return ""
+    }
+    return str.Substr(rest, 0, q)
+}
+
+// FormValue returns the first plain-field part named `name`.
+pub fn FormValue(c: *zilla_ctx.Ctx, name: string) -> string {
+    parts, err := MultipartForm(c)
+    if str.Len(err.message) > 0 {
+        return ""
+    }
+    for i := 0; i < len(parts); i = i + 1 {
+        if str.Equal(parts[i].Name, name) && str.Len(parts[i].Filename) == 0 {
+            return parts[i].Data
+        }
+    }
+    return ""
+}
+
+// FormFile returns the first file part named `name` ("" Data when
+// absent).
+pub fn FormFile(c: *zilla_ctx.Ctx, name: string) -> (Part, bool) {
+    parts, err := MultipartForm(c)
+    if str.Len(err.message) > 0 {
+        return Part{}, false
+    }
+    for i := 0; i < len(parts); i = i + 1 {
+        if str.Equal(parts[i].Name, name) && str.Len(parts[i].Filename) > 0 {
+            return parts[i], true
+        }
+    }
+    return Part{}, false
+}

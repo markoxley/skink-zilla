@@ -1,0 +1,143 @@
+// File:    zilla_authz.skink
+// Purpose: Authentication/authorization middleware for skink-zilla.
+//          RequireAuth verifies a Bearer JWT (HS256, zilla_jwt) and
+//          stores the verified claims JSON in ctx Locals under
+//          "zilla.jwt_claims" plus convenience keys like "zilla.sub" —
+//          handlers read them with zilla_ctx.Local. RequireClaim and
+//          RequireRole gate on claim values/roles inside "roles" (a
+//          comma-separated or JSON array claim).
+module zilla_authz
+
+import "std/str"
+import "std/json"
+import "zilla_ctx"
+import "zilla_jwt"
+
+// LOC_CLAIMS is the Locals key holding the verified claims JSON.
+pub const LOC_CLAIMS = "zilla.jwt_claims"
+
+// RequireAuth returns middleware that rejects requests without a valid
+// `Authorization: Bearer <jwt>` signed with secret. On success the
+// claims JSON is stored in Locals["zilla.jwt_claims"] and "zilla.sub" is
+// set to the sub claim for convenience.
+pub fn RequireAuth(secret: string) -> fn(fn(*zilla_ctx.Ctx)) -> fn(*zilla_ctx.Ctx) {
+    return fn(next: fn(*zilla_ctx.Ctx)) -> fn(*zilla_ctx.Ctx) {
+        return fn(c: *zilla_ctx.Ctx) {
+            tok := bearer(zilla_ctx.Header(c, "Authorization"))
+            if str.Len(tok) == 0 {
+                zilla_ctx.SendStatus(c, 401)
+                return
+            }
+            cl, err := zilla_jwt.Verify(tok, secret)
+            if str.Len(err.message) > 0 {
+                zilla_ctx.SendStatus(c, 401)
+                return
+            }
+            zilla_ctx.SetLocal(c, LOC_CLAIMS, cl.Raw)
+            sub := zilla_jwt.Get(&cl, "sub")
+            if str.Len(sub) > 0 {
+                zilla_ctx.SetLocal(c, "zilla.sub", sub)
+            }
+            next(c)
+        }
+    }
+}
+
+// bearer extracts the token from "Bearer <tok>".
+fn bearer(h: string) -> string {
+    if str.Len(h) < 8 {
+        return ""
+    }
+    if !str.Equal(str.Substr(h, 0, 7), "Bearer ") {
+        return ""
+    }
+    return str.Trim(str.Substr(h, 7, str.Len(h) - 7))
+}
+
+// claimsOf parses the Locals claims JSON set by RequireAuth.
+fn claimsOf(c: *zilla_ctx.Ctx) -> (json.Value, bool) {
+    raw := zilla_ctx.Local(c, LOC_CLAIMS)
+    if str.Len(raw) == 0 {
+        return json.Null(), false
+    }
+    v, err := json.Unmarshal(raw)
+    if str.Len(err.message) > 0 {
+        return json.Null(), false
+    }
+    return v, true
+}
+
+// RequireClaim returns middleware requiring claim `key` == `value`
+// (string equality on the claim's text form). Must run after
+// RequireAuth. Rejects with 403.
+pub fn RequireClaim(key: string, value: string) -> fn(fn(*zilla_ctx.Ctx)) -> fn(*zilla_ctx.Ctx) {
+    return fn(next: fn(*zilla_ctx.Ctx)) -> fn(*zilla_ctx.Ctx) {
+        return fn(c: *zilla_ctx.Ctx) {
+            v, ok := claimsOf(c)
+            if !ok {
+                zilla_ctx.SendStatus(c, 401)
+                return
+            }
+            got := json.GetString(v, key)
+            if str.Len(got) == 0 {
+                // numeric claim?
+                num := json.GetNumber(v, key)
+                if num != 0.0 && str.Equal(json.MarshalValue(json.FromNumber(num)), value) {
+                    next(c)
+                    return
+                }
+                zilla_ctx.SendStatus(c, 403)
+                return
+            }
+            if !str.Equal(got, value) {
+                zilla_ctx.SendStatus(c, 403)
+                return
+            }
+            next(c)
+        }
+    }
+}
+
+// RequireRole returns middleware requiring `role` inside the claims'
+// "roles" claim — either a JSON array of strings or a comma-separated
+// string. Must run after RequireAuth. Rejects with 403.
+pub fn RequireRole(role: string) -> fn(fn(*zilla_ctx.Ctx)) -> fn(*zilla_ctx.Ctx) {
+    return fn(next: fn(*zilla_ctx.Ctx)) -> fn(*zilla_ctx.Ctx) {
+        return fn(c: *zilla_ctx.Ctx) {
+            v, ok := claimsOf(c)
+            if !ok {
+                zilla_ctx.SendStatus(c, 401)
+                return
+            }
+            if hasRole(v, role) {
+                next(c)
+                return
+            }
+            zilla_ctx.SendStatus(c, 403)
+        }
+    }
+}
+
+// hasRole checks roles array or comma-separated string claims.
+fn hasRole(v: json.Value, role: string) -> bool {
+    arr := json.GetArray(v, "roles")
+    if json.ArrayLen(arr) > 0 {
+        for i := 0; i < json.ArrayLen(arr); i = i + 1 {
+            if str.Equal(json.AsString(json.ArrayGet(arr, i)), role) {
+                return true
+            }
+        }
+        return false
+    }
+    s := json.GetString(v, "roles")
+    if str.Len(s) == 0 {
+        return false
+    }
+    parts := str.Split(s, ",")
+    for i := 0; i < len(parts); i = i + 1 {
+        if str.Equal(str.Trim(parts[i]), role) {
+            return true
+        }
+    }
+    return false
+}

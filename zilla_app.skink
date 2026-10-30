@@ -1,0 +1,186 @@
+// File:    zilla_app.skink
+// Purpose: Fiber-style application object for skink-zilla. App wraps
+//          std/web's Router + Server and adapts fn(*Ctx) handlers to
+//          types.Handler, applying middleware chains, route groups,
+//          and a static-file helper.
+//
+//          Web middleware (fn(fn(*Ctx)) -> fn(*Ctx)) is applied inside
+//          the route adapter at REQUEST time, so middleware registered
+//          after routes still wraps them — matching Fiber semantics.
+//          Router-level types.Middleware (registered via Use) is applied
+//          by std/web's ServeHTTP.
+module zilla_app
+
+import "std/str"
+import "std/errors"
+import "std/web/types"
+import "std/web/router"
+import "std/web/server"
+import "std/web/static"
+import "zilla_ctx"
+
+// Canonical web-middleware signature — used verbatim (not via a named
+// alias) because cross-module fn-type aliases do not unify:
+//   fn(fn(*zilla_ctx.Ctx)) -> fn(*zilla_ctx.Ctx)
+
+// App is the top-level web application.
+pub struct App {
+    R:      router.Router
+    Port:   int
+    srv:    server.Server
+    webMws: []fn(fn(*zilla_ctx.Ctx)) -> fn(*zilla_ctx.Ctx)
+}
+
+// New creates an App on the given port.
+pub fn New(port: int) -> App {
+    var mws []fn(fn(*zilla_ctx.Ctx)) -> fn(*zilla_ctx.Ctx)
+    return App{R: router.NewRouter(), Port: port, webMws: mws}
+}
+
+// mkAdapter wraps a web handler as a std/web types.Handler. The
+// returned closure reads a.webMws at request time so middleware order
+// is registration order regardless of route registration.
+fn mkAdapter(a: *App, h: fn(*zilla_ctx.Ctx)) -> types.Handler {
+    return fn(req: types.Request, res: *types.ResponseWriter) {
+        ctx := zilla_ctx.NewCtx(req, res)
+        var cur fn(*zilla_ctx.Ctx)
+        cur = h
+        for i := len(a.webMws) - 1; i >= 0; i = i - 1 {
+            cur = a.webMws[i](cur)
+        }
+        cur(&ctx)
+    }
+}
+
+// ---- routes -----------------------------------------------------------------------
+
+// Handle registers a method+pattern route.
+pub fn Handle(a: *App, method: string, pattern: string, h: fn(*zilla_ctx.Ctx)) {
+    a.R.Handle(method, pattern, mkAdapter(a, h))
+}
+
+// Get registers a GET route.
+pub fn Get(a: *App, pattern: string, h: fn(*zilla_ctx.Ctx)) {
+    a.R.Get(pattern, mkAdapter(a, h))
+}
+
+// Post registers a POST route.
+pub fn Post(a: *App, pattern: string, h: fn(*zilla_ctx.Ctx)) {
+    a.R.Post(pattern, mkAdapter(a, h))
+}
+
+// Put registers a PUT route.
+pub fn Put(a: *App, pattern: string, h: fn(*zilla_ctx.Ctx)) {
+    a.R.Put(pattern, mkAdapter(a, h))
+}
+
+// Delete registers a DELETE route.
+pub fn Delete(a: *App, pattern: string, h: fn(*zilla_ctx.Ctx)) {
+    a.R.Delete(pattern, mkAdapter(a, h))
+}
+
+// Patch registers a PATCH route.
+pub fn Patch(a: *App, pattern: string, h: fn(*zilla_ctx.Ctx)) {
+    a.R.Handle("PATCH", pattern, mkAdapter(a, h))
+}
+
+// Options registers an OPTIONS route.
+pub fn Options(a: *App, pattern: string, h: fn(*zilla_ctx.Ctx)) {
+    a.R.Handle("OPTIONS", pattern, mkAdapter(a, h))
+}
+
+// Head registers a HEAD route.
+pub fn Head(a: *App, pattern: string, h: fn(*zilla_ctx.Ctx)) {
+    a.R.Handle("HEAD", pattern, mkAdapter(a, h))
+}
+
+// Use registers a std/web middleware — it runs inside ServeHTTP for
+// every request (use this for types.Middleware-typed middleware such
+// as the bundled CORS/rate-limit adapters).
+pub fn Use(a: *App, mw: types.Middleware) {
+    a.R.Use(mw)
+}
+
+// UseWeb registers skink-zilla middleware (fn(*Ctx) wrappers); applied
+// inside the adapter at request time.
+pub fn UseWeb(a: *App, mw: fn(fn(*zilla_ctx.Ctx)) -> fn(*zilla_ctx.Ctx)) {
+    a.webMws = append(a.webMws, mw)
+}
+
+// ---- groups ------------------------------------------------------------------------
+
+// Group is a prefix-scoped route view; group middleware only wraps
+// routes registered through the group.
+pub struct Group {
+    app:    *App
+    prefix: string
+    mws:    []fn(fn(*zilla_ctx.Ctx)) -> fn(*zilla_ctx.Ctx)
+}
+
+// Group creates a route group at prefix (e.g. Group(app, "/api")).
+pub fn GroupAt(a: *App, prefix: string) -> Group {
+    var mws []fn(fn(*zilla_ctx.Ctx)) -> fn(*zilla_ctx.Ctx)
+    return Group{app: a, prefix: prefix, mws: mws}
+}
+
+// GroupUse attaches middleware to the group only. Register it before
+// the group's routes — group middleware is bound at registration.
+pub fn GroupUse(g: *Group, mw: fn(fn(*zilla_ctx.Ctx)) -> fn(*zilla_ctx.Ctx)) {
+    g.mws = append(g.mws, mw)
+}
+
+// GroupHandle registers method+pattern inside the group.
+pub fn GroupHandle(g: *Group, method: string, pattern: string, h: fn(*zilla_ctx.Ctx)) {
+    var cur fn(*zilla_ctx.Ctx)
+    cur = h
+    for i := len(g.mws) - 1; i >= 0; i = i - 1 {
+        cur = g.mws[i](cur)
+    }
+    g.app.R.Handle(method, str.Concat(g.prefix, pattern), mkAdapter(g.app, cur))
+}
+
+// GroupGet/GroupPost/GroupPut/GroupDelete/GroupPatch are verb helpers.
+pub fn GroupGet(g: *Group, pattern: string, h: fn(*zilla_ctx.Ctx)) {
+    GroupHandle(g, "GET", pattern, h)
+}
+pub fn GroupPost(g: *Group, pattern: string, h: fn(*zilla_ctx.Ctx)) {
+    GroupHandle(g, "POST", pattern, h)
+}
+pub fn GroupPut(g: *Group, pattern: string, h: fn(*zilla_ctx.Ctx)) {
+    GroupHandle(g, "PUT", pattern, h)
+}
+pub fn GroupDelete(g: *Group, pattern: string, h: fn(*zilla_ctx.Ctx)) {
+    GroupHandle(g, "DELETE", pattern, h)
+}
+pub fn GroupPatch(g: *Group, pattern: string, h: fn(*zilla_ctx.Ctx)) {
+    GroupHandle(g, "PATCH", pattern, h)
+}
+
+// ---- static ------------------------------------------------------------------------
+
+// Static serves files from dir under the URL prefix (e.g.
+// Static(app, "/static", "./public")).
+pub fn Static(a: *App, prefix: string, dir: string) {
+    h := static.FileServer(dir)
+    a.R.Get(str.Concat(prefix, "/*"), h)
+}
+
+// ---- serve --------------------------------------------------------------------------
+
+// Listen starts the HTTP server (blocking).
+pub fn Listen(a: *App) -> errors.Error {
+    a.srv = server.NewServer(a.Port, &a.R)
+    return a.srv.ListenAndServe()
+}
+
+// ListenTLS starts HTTPS (blocking).
+pub fn ListenTLS(a: *App, certFile: string, keyFile: string) -> errors.Error {
+    a.srv = server.NewServer(a.Port, &a.R)
+    return a.srv.ListenAndServeTLS(certFile, keyFile)
+}
+
+// ServerPtr exposes the underlying std/web server (for SetLimits, TLS
+// SNI, Shutdown).
+pub fn ServerPtr(a: *App) -> *server.Server {
+    return &a.srv
+}

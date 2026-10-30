@@ -1,0 +1,288 @@
+// File:    zilla_ctx.skink
+// Purpose: Fiber-style request context for skink-zilla. Ctx wraps the
+//          std/web Request + ResponseWriter with a fluent, fiber-like
+//          API: Params/Query/Body access, JSON/Text/HTML senders,
+//          cookie helpers, redirects, and per-request Locals storage
+//          (used by middleware to hand data — e.g. JWT claims — to
+//          handlers). Handlers are fn(*Ctx); the app layer adapts them
+//          to std/web's types.Handler.
+module zilla_ctx
+
+import "std/str"
+import "std/errors"
+import "std/json"
+import "std/web/types"
+
+// WebHandler is the skink-zilla handler signature — declared as a
+// struct-free alias note rather than `pub type` because cross-module
+// type aliases do not unify with canonical fn types in the checker.
+// Everywhere a WebHandler is expected, the canonical type is
+//     fn(*zilla_ctx.Ctx)
+// and for middleware:
+//     fn(fn(*zilla_ctx.Ctx)) -> fn(*zilla_ctx.Ctx)
+
+// Ctx is the per-request context passed to handlers.
+pub struct Ctx {
+    Req:     types.Request
+    Res:     *types.ResponseWriter
+    Locals:  map[string]string  // middleware → handler value channel
+    handled: bool               // set by send helpers; informational
+}
+
+// NewCtx builds a Ctx over the std/web pair.
+pub fn NewCtx(req: types.Request, res: *types.ResponseWriter) -> Ctx {
+    return Ctx{Req: req, Res: res, Locals: make(map[string]string)}
+}
+
+// ---- request accessors ---------------------------------------------------------
+
+// Method returns the HTTP method.
+pub fn Method(c: *Ctx) -> string {
+    return c.Req.Method()
+}
+
+// Path returns the request path.
+pub fn Path(c: *Ctx) -> string {
+    return c.Req.Path()
+}
+
+// Param returns a route parameter (e.g. :id in the pattern).
+pub fn Param(c: *Ctx, name: string) -> string {
+    return c.Req.URLParam(name)
+}
+
+// Query returns a query-string parameter.
+pub fn Query(c: *Ctx, name: string) -> string {
+    return c.Req.QueryParam(name)
+}
+
+// QueryDefault is Query with a fallback.
+pub fn QueryDefault(c: *Ctx, name: string, def: string) -> string {
+    v := c.Req.QueryParam(name)
+    if str.Len(v) == 0 {
+        return def
+    }
+    return v
+}
+
+// Body returns the request body text (NUL-safe view — binary bodies
+// may be truncated; use BodyBytes for raw payloads).
+pub fn Body(c: *Ctx) -> string {
+    return c.Req.Body()
+}
+
+// BodyBytes returns raw body bytes + length (binary-safe).
+pub fn BodyBytes(c: *Ctx) -> (string, int) {
+    return c.Req.BodyBytes(), c.Req.BodyLen()
+}
+
+// Header returns a request header (case-insensitive).
+pub fn Header(c: *Ctx, key: string) -> string {
+    return c.Req.Header(key)
+}
+
+// IP returns the best available client IP: the real peer address when
+// the server injects "remote_addr", else the X-Forwarded-For first
+// hop. NOTE: at this layer BOTH values can arrive as ordinary request
+// headers, so an attacker can forge them — do not use IP() for
+// security decisions (auth, rate-limit keys on shared infra) until
+// the server plumbs the socket peer address through (comp_error.md).
+pub fn IP(c: *Ctx) -> string {
+    // The socket peer (server-populated, unforgeable) wins outright.
+    pa := c.Req.PeerAddr()
+    if str.Len(pa) > 0 {
+        return pa
+    }
+    ra := c.Req.Header("remote_addr")
+    if str.Len(ra) > 0 {
+        return ra
+    }
+    xff := c.Req.Header("x-forwarded-for")
+    if str.Len(xff) > 0 {
+        comma := str.IndexOf(xff, ",")
+        if comma >= 0 {
+            return str.Trim(str.Substr(xff, 0, comma))
+        }
+        return str.Trim(xff)
+    }
+    return ""
+}
+
+// ParseJSON parses the request body as JSON.
+pub fn ParseJSON(c: *Ctx) -> (json.Value, errors.Error) {
+    return c.Req.ParseJSON()
+}
+
+// ---- response senders ------------------------------------------------------------
+
+// Set sets a response header.
+pub fn Set(c: *Ctx, key: string, value: string) {
+    c.Res.Header(key, value)
+}
+
+// Status only sets the response status code.
+pub fn Status(c: *Ctx, code: int) {
+    c.Res.WriteHeader(code)
+    c.handled = true
+}
+
+// Send writes a raw text body with the current status.
+pub fn Send(c: *Ctx, body: string) {
+    c.Res.Write(body)
+    c.handled = true
+}
+
+// SendString is Send (Fiber parity).
+pub fn SendString(c: *Ctx, body: string) {
+    Send(c, body)
+}
+
+// Text sends a text/plain response.
+pub fn Text(c: *Ctx, code: int, body: string) {
+    c.Res.Text(code, body)
+    c.handled = true
+}
+
+// JSON sends an application/json response. data is a JSON string —
+// compose with std/json marshalling.
+pub fn JSON(c: *Ctx, code: int, data: string) {
+    c.Res.JSON(code, data)
+    c.handled = true
+}
+
+// JSONValue sends a json.Value response.
+pub fn JSONValue(c: *Ctx, code: int, v: json.Value) {
+    c.Res.JSONValue(code, v)
+    c.handled = true
+}
+
+// HTML sends a text/html response.
+pub fn HTML(c: *Ctx, code: int, data: string) {
+    c.Res.HTML(code, data)
+    c.handled = true
+}
+
+// SendStatus sends a bare status response with the canonical reason
+// text as a plain body.
+pub fn SendStatus(c: *Ctx, code: int) {
+    Text(c, code, reasonText(code))
+}
+
+// reasonText maps common codes to reason phrases.
+fn reasonText(code: int) -> string {
+    if code == 200 { return "OK" }
+    if code == 201 { return "Created" }
+    if code == 204 { return "No Content" }
+    if code == 301 { return "Moved Permanently" }
+    if code == 302 { return "Found" }
+    if code == 400 { return "Bad Request" }
+    if code == 401 { return "Unauthorized" }
+    if code == 403 { return "Forbidden" }
+    if code == 404 { return "Not Found" }
+    if code == 405 { return "Method Not Allowed" }
+    if code == 429 { return "Too Many Requests" }
+    if code == 500 { return "Internal Server Error" }
+    if code == 503 { return "Service Unavailable" }
+    return "Status"
+}
+
+// Redirect sends a Location redirect (default 302).
+pub fn Redirect(c: *Ctx, url: string) {
+    RedirectStatus(c, url, 302)
+}
+
+// RedirectStatus sends a redirect with an explicit code.
+pub fn RedirectStatus(c: *Ctx, url: string, code: int) {
+    c.Res.Header("Location", url)
+    c.Res.WriteHeader(code)
+    c.handled = true
+}
+
+// ---- cookies ---------------------------------------------------------------------
+
+// Cookie reads a request cookie by name from the Cookie header.
+pub fn Cookie(c: *Ctx, name: string) -> string {
+    hdr := c.Req.Header("cookie")
+    prefix := str.Concat(name, "=")
+    rest := hdr
+    for str.Len(rest) > 0 {
+        semi := str.IndexOf(rest, ";")
+        var part string
+        if semi < 0 {
+            part = rest
+            rest = ""
+        } else {
+            part = str.Substr(rest, 0, semi)
+            rest = str.Substr(rest, semi + 1, str.Len(rest) - semi - 1)
+        }
+        part = str.Trim(part)
+        if str.StartsWith(part, prefix) {
+            return types.URLDecode(
+                str.Substr(part, str.Len(prefix), str.Len(part) - str.Len(prefix)),
+                false)
+        }
+    }
+    return ""
+}
+
+// SetCookie sets a response cookie (append-style Set-Cookie header —
+// repeated Set-Cookie headers are supported by the writer's Header
+// map only for a single value, so multiple cookies must use distinct
+// calls carefully; most apps set one session cookie).
+pub fn SetCookie(c: *Ctx, name: string, value: string, maxAgeSecs: int, path: string, httpOnly: bool) {
+    v := str.Concat(name, str.Concat("=", value))
+    if str.Len(path) > 0 {
+        v = str.Concat(v, str.Concat("; Path=", path))
+    }
+    if maxAgeSecs >= 0 {
+        v = str.Concat(v, str.Concat("; Max-Age=", itoa(maxAgeSecs)))
+    }
+    if httpOnly {
+        v = str.Concat(v, "; HttpOnly")
+    }
+    v = str.Concat(v, "; SameSite=Lax")
+    c.Res.Header("Set-Cookie", v)
+}
+
+// ClearCookie expires a cookie.
+pub fn ClearCookie(c: *Ctx, name: string, path: string) {
+    v := str.Concat(name, str.Concat("=; Path=", str.Concat(path, "; Max-Age=0")))
+    c.Res.Header("Set-Cookie", v)
+}
+
+// ---- locals ----------------------------------------------------------------------
+
+// Set stores a string in request Locals (middleware → handler).
+pub fn SetLocal(c: *Ctx, key: string, value: string) {
+    c.Locals[key] = value
+}
+
+// Get reads a Locals value.
+pub fn Local(c: *Ctx, key: string) -> string {
+    v, ok := c.Locals[key]
+    if ok {
+        return v
+    }
+    return ""
+}
+
+// itoa is a local int→string (avoids strconv import noise).
+fn itoa(n: int) -> string {
+    if n == 0 {
+        return "0"
+    }
+    neg := n < 0
+    m := n
+    if neg {
+        m = -m
+    }
+    s := ""
+    for m > 0 {
+        s = str.Concat(str.Substr("0123456789", m % 10, 1), s)
+        m = m / 10
+    }
+    if neg {
+        s = str.Concat("-", s)
+    }
+    return s
+}

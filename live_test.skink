@@ -1,0 +1,401 @@
+// File:    live_test.skink
+// Purpose: Live end-to-end test for skink-zilla over real TCP — spawns a
+//          real App server on port 18211 and drives it with raw socket
+//          requests: routes + params, JWT-protected route, rate limit,
+//          CORS preflight, multipart upload, and a full WebSocket
+//          handshake + masked-frame echo round-trip.
+module main
+
+import "zilla_app"
+import "zilla_ctx"
+import "zilla_jwt"
+import "zilla_authz"
+import "zilla_ratelimit"
+import "zilla_cors"
+import "zilla_upload"
+import "zilla_ws"
+import "std/net"
+import "std/str"
+import "std/time"
+import "std/errors"
+import "std/libc"
+
+var failures = 0
+
+fn check(ok: bool, what: string) {
+    if !ok {
+        println("FAIL:", what)
+        failures = failures + 1
+    }
+}
+
+const PORT = 18211
+
+// --- handlers ---------------------------------------------------------------
+
+fn hHello(c: *zilla_ctx.Ctx) {
+    zilla_ctx.Text(c, 200, "hi")
+}
+
+fn hParam(c: *zilla_ctx.Ctx) {
+    zilla_ctx.Text(c, 200, zilla_ctx.Param(c, "id"))
+}
+
+fn hWho(c: *zilla_ctx.Ctx) {
+    zilla_ctx.Text(c, 200, zilla_ctx.Local(c, "zilla.sub"))
+}
+
+fn hUpload(c: *zilla_ctx.Ctx) {
+    part, ok := zilla_upload.FormFile(c, "doc")
+    if !ok {
+        zilla_ctx.SendStatus(c, 400)
+        return
+    }
+    zilla_ctx.Text(c, 200, str.Concat(part.Filename, str.Concat(":", part.Data)))
+}
+
+fn hWS(c: *zilla_ctx.Ctx) {
+    err := zilla_ws.Upgrade(c, wsEcho)
+    if str.Len(err.message) > 0 {
+        zilla_ctx.SendStatus(c, 400)
+    }
+}
+
+fn wsEcho(ws: *zilla_ws.Conn) {
+    for {
+        f, err := zilla_ws.Read(ws)
+        if str.Len(err.message) > 0 {
+            zilla_ws.Close(ws)
+            return
+        }
+        if f.Op == zilla_ws.OP_CLOSE {
+            zilla_ws.Close(ws)
+            return
+        }
+        if f.Op == zilla_ws.OP_PING {
+            zilla_ws.Pong(ws, f.Data, f.Len)
+            continue
+        }
+        // echo text/binary back
+        zilla_ws.Write(ws, f.Op, f.Data, f.Len)
+    }
+}
+
+// --- raw client helpers ------------------------------------------------------
+
+// httpReq sends one request and returns the raw response.
+fn httpReq(req: string) -> string {
+    conn, err := net.Connect("127.0.0.1", PORT)
+    if str.Len(err.message) > 0 {
+        return ""
+    }
+    conn.SetTimeout(5000)
+    conn.SendAll(req, str.Len(req))
+    total := ""
+    for i := 0; i < 60; i = i + 1 {
+        chunk, rerr := conn.Recv(65536)
+        if str.Len(rerr.message) > 0 {
+            break
+        }
+        if str.Len(chunk) == 0 {
+            break
+        }
+        total = str.Concat(total, chunk)
+        // got full response when we see the body's end… crude: wait a
+        // tick more to coalesce
+        if str.Contains(total, "\r\n\r\n") && str.Len(total) > 0 {
+            // parse Content-Length when present and stop when complete
+            if hasFullBody(total) {
+                break
+            }
+        }
+    }
+    conn.Close()
+    return total
+}
+
+// hasFullBody reports whether resp contains headers + a complete body
+// per Content-Length (or no body expected).
+fn hasFullBody(resp: string) -> bool {
+    hidx := str.IndexOf(resp, "\r\n\r\n")
+    if hidx < 0 {
+        return false
+    }
+    head := str.Substr(resp, 0, hidx)
+    cli := str.IndexOf(str.ToLower(head), "content-length:")
+    if cli < 0 {
+        return true   // bodyless (204, etc.)
+    }
+    rest := str.Substr(head, cli + 15, str.Len(head) - cli - 15)
+    nl := str.IndexOf(rest, "\r\n")
+    if nl >= 0 {
+        rest = str.Substr(rest, 0, nl)
+    }
+    want := atoi(str.Trim(rest))
+    have := str.Len(resp) - hidx - 4
+    return have >= want
+}
+
+fn atoi(s: string) -> int {
+    n := 0
+    for i := 0; i < str.Len(s); i = i + 1 {
+        c := int(s[i])
+        if c >= 48 && c <= 57 {
+            n = n * 10 + (c - 48)
+        }
+    }
+    return n
+}
+
+// statusLine extracts the numeric status.
+fn statusCode(resp: string) -> int {
+    if str.Len(resp) < 12 {
+        return -1
+    }
+    // "HTTP/1.1 NNN "
+    return atoi(str.Substr(resp, 9, 3))
+}
+
+// responseBody returns the text after the blank line.
+fn responseBody(resp: string) -> string {
+    idx := str.IndexOf(resp, "\r\n\r\n")
+    if idx < 0 {
+        return ""
+    }
+    return str.Substr(resp, idx + 4, str.Len(resp) - idx - 4)
+}
+
+// --- ws client helpers -------------------------------------------------------
+
+// wsClient wraps a TCP conn for the handshake + frame IO.
+struct wsClient {
+    conn: net.Connection
+}
+
+fn wsDial(path: string) -> (wsClient, bool) {
+    var wc wsClient
+    conn, err := net.Connect("127.0.0.1", PORT)
+    if str.Len(err.message) > 0 {
+        return wc, false
+    }
+    conn.SetTimeout(5000)
+    wc.conn = conn
+    req := str.Concat("GET ", str.Concat(path,
+        str.Concat(" HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==",
+        "\r\nSec-WebSocket-Version: 13\r\n\r\n")))
+    conn.SendAll(req, str.Len(req))
+    // read the 101 response
+    resp := ""
+    for i := 0; i < 40; i = i + 1 {
+        ch, rerr := conn.Recv(4096)
+        if str.Len(rerr.message) > 0 {
+            return wc, false
+        }
+        resp = str.Concat(resp, ch)
+        if str.Contains(resp, "\r\n\r\n") {
+            break
+        }
+    }
+    if !str.Contains(resp, "101") || !str.Contains(resp, "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=") {
+        println("bad ws handshake:", resp)
+        return wc, false
+    }
+    return wc, true
+}
+
+// wsSendMask sends a masked client frame.
+fn wsSendMask(c: *wsClient, op: int, data: string) {
+    n := str.Len(data)
+    hlen := 2
+    if n >= 126 {
+        hlen = 4
+    }
+    out := libc.malloc(hlen + 4 + n)
+    out[0] = 0x80 | op
+    if n < 126 {
+        out[1] = 0x80 | n
+    } else {
+        out[1] = 0x80 | 126
+        out[2] = n >> 8
+        out[3] = n & 255
+    }
+    // fixed mask 0xAABBCCDD (test client)
+    out[hlen] = 0xAA
+    out[hlen + 1] = 0xBB
+    out[hlen + 2] = 0xCC
+    out[hlen + 3] = 0xDD
+    for i := 0; i < n; i = i + 1 {
+        mk := 0xAA
+        if i % 4 == 1 { mk = 0xBB }
+        if i % 4 == 2 { mk = 0xCC }
+        if i % 4 == 3 { mk = 0xDD }
+        out[hlen + 4 + i] = int(data[i]) ^ mk
+    }
+    c.conn.SendAll(out, hlen + 4 + n)
+    libc.free(out)
+}
+
+// readN reads exactly n bytes or reports failure.
+fn readN(conn: *net.Connection, n: int) -> (string, bool) {
+    out := libc.malloc(n + 1)
+    have := 0
+    for have < n {
+        chunk, err := conn.Recv(n - have)
+        if str.Len(err.message) > 0 || str.Len(chunk) == 0 {
+            libc.free(out)
+            return "", false
+        }
+        libc.memcpy(string(int64(out) + int64(have)), chunk, str.Len(chunk))
+        have = have + str.Len(chunk)
+    }
+    out[n] = 0
+    return out, true
+}
+
+// wsRecv reads one server frame (unmasked).
+fn wsRecv(c: *wsClient) -> (int, string) {
+    hdr, ok := readN(&c.conn, 2)
+    if !ok {
+        return -1, ""
+    }
+    op := int(hdr[0]) & 0x0F
+    plen := int(hdr[1]) & 0x7F
+    if plen == 126 {
+        ext, ok2 := readN(&c.conn, 2)
+        if !ok2 {
+            return -1, ""
+        }
+        plen = (int(ext[0]) << 8) | int(ext[1])
+    }
+    if plen == 0 {
+        return op, ""
+    }
+    data, ok3 := readN(&c.conn, plen)
+    if !ok3 {
+        return -1, ""
+    }
+    return op, str.Substr(data, 0, plen)
+}
+
+// --- main ---------------------------------------------------------------------
+
+fn serve(a: *zilla_app.App) {
+    zilla_app.Listen(a)
+}
+
+fn main() -> int {
+    app := zilla_app.New(PORT)
+    zilla_cors.Install(&app, zilla_cors.DefaultConfig())
+    zilla_app.Get(&app, "/hello", hHello)
+    zilla_app.Get(&app, "/user/:id", hParam)
+    zilla_app.Post(&app, "/upload", hUpload)
+    zilla_app.Get(&app, "/ws", hWS)
+
+    // protected route
+    secret := "live-secret"
+    zilla_app.Get(&app, "/me", fn(c: *zilla_ctx.Ctx) {
+        // inline the authz check via middleware wrap for this one route
+        zilla_ctx.Text(c, 401, "unused")
+    })
+    // proper protected group
+    api := zilla_app.GroupAt(&app, "/api")
+    zilla_app.GroupUse(&api, zilla_authz.RequireAuth(secret))
+    zilla_app.GroupGet(&api, "/who", hWho)
+
+    // rate-limited route
+    lim := zilla_ratelimit.NewLimiter(2, int64(60))
+    rl := zilla_app.GroupAt(&app, "/limited")
+    zilla_app.GroupUse(&rl, zilla_ratelimit.Middleware(&lim, "x-api-key"))
+    zilla_app.GroupGet(&rl, "/hit", hHello)
+
+    spawn serve(&app)
+    // wait for accept loop
+    up := false
+    for i := 0; i < 60; i = i + 1 {
+        conn, err := net.Connect("127.0.0.1", PORT)
+        if str.Len(err.message) == 0 {
+            conn.Close()
+            up = true
+            break
+        }
+        time.SleepMs(50)
+    }
+    if !up {
+        println("FAIL: server never came up")
+        return 1
+    }
+
+    // plain route
+    r := httpReq("GET /hello HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+    check(statusCode(r) == 200, "GET /hello 200")
+    check(str.Equal(responseBody(r), "hi"), "hello body")
+
+    // route param
+    r = httpReq("GET /user/42 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+    check(statusCode(r) == 200, "param route")
+    check(str.Equal(responseBody(r), "42"), "param value")
+
+    // JWT — no token → 401
+    r = httpReq("GET /api/who HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+    check(statusCode(r) == 401, "unauth 401")
+
+    // JWT — valid token → 200 + sub
+    tok := zilla_jwt.Sign("{\"sub\":\"ada\"}", secret, int64(3600))
+    r = httpReq(str.Concat("GET /api/who HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer ",
+        str.Concat(tok, "\r\nConnection: close\r\n\r\n")))
+    check(statusCode(r) == 200, "auth 200")
+    check(str.Equal(responseBody(r), "ada"), "sub claim in locals")
+
+    // rate limit: 2 allowed then 429
+    base := "GET /limited/hit HTTP/1.1\r\nHost: x\r\nX-Api-Key: k1\r\nConnection: close\r\n\r\n"
+    c1 := statusCode(httpReq(base))
+    c2 := statusCode(httpReq(base))
+    c3 := statusCode(httpReq(base))
+    check(c1 == 200 && c2 == 200 && c3 == 429, "rate limit 200,200,429")
+
+    // CORS preflight
+    r = httpReq("OPTIONS /hello HTTP/1.1\r\nHost: x\r\nOrigin: https://ok.example\r\nAccess-Control-Request-Method: GET\r\nConnection: close\r\n\r\n")
+    check(statusCode(r) == 204, "preflight 204")
+    check(str.Contains(str.ToLower(r), "access-control-allow-origin"), "acao header")
+
+    // multipart upload
+    body := str.Concat("--BB\r\n",
+        str.Concat("Content-Disposition: form-data; name=\"doc\"; filename=\"f.txt\"\r\n",
+        str.Concat("\r\nPAYLOAD-BYTES\r\n--BB--\r\n", "")))
+    req := str.Concat("POST /upload HTTP/1.1\r\nHost: x\r\nContent-Type: multipart/form-data; boundary=BB\r\nContent-Length: ",
+        str.Concat(itoa(str.Len(body)), str.Concat("\r\nConnection: close\r\n\r\n", body)))
+    r = httpReq(req)
+    check(statusCode(r) == 200, "upload 200")
+    check(str.Equal(responseBody(r), "f.txt:PAYLOAD-BYTES"), "upload contents")
+
+    // WebSocket echo over a real socket
+    wc, ok := wsDial("/ws")
+    check(ok, "ws handshake")
+    if ok {
+        wsSendMask(&wc, 1, "ping-hello")
+        op, data := wsRecv(&wc)
+        check(op == 1, "echo is text")
+        check(str.Equal(data, "ping-hello"), "echo payload")
+        wc.conn.Close()
+    }
+
+    if failures > 0 {
+        println("FAIL live_test:", failures)
+        return 1
+    }
+    println("PASS live_test")
+    return 0
+}
+
+fn itoa(n: int) -> string {
+    if n == 0 {
+        return "0"
+    }
+    s := ""
+    m := n
+    for m > 0 {
+        s = str.Concat(str.Substr("0123456789", m % 10, 1), s)
+        m = m / 10
+    }
+    return s
+}

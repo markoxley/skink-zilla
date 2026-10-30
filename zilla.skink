@@ -1,0 +1,33 @@
+// File:    zilla.skink
+// Purpose: Root module for skink-zilla — a Fiber-style web framework
+//          over std/web. Re-exports the app/ctx surface and pulls in
+//          jwt, session, authz, rate-limit, CORS, uploads, and
+//          WebSocket modules so `import "zilla"` is enough for common
+//          use.
+//
+//          Layers:
+//            zilla_ctx       — Ctx request/response wrapper + Locals
+//            zilla_app       — App, routing, groups, static, Listen
+//            zilla_jwt       — HS256 JWT sign/verify
+//            zilla_session   — cookie-backed server-side sessions
+//            zilla_authz     — RequireAuth/RequireRole middleware
+//            zilla_ratelimit — per-key fixed-window limiter
+//            zilla_cors      — CORS + preflight
+//            zilla_upload    — multipart/form-data files
+//            zilla_ws        — WebSocket upgrade + frames
+module zilla
+
+import "zilla_ctx"
+import "zilla_app"
+import "zilla_jwt"
+import "zilla_session"
+import "zilla_authz"
+import "zilla_ratelimit"
+import "zilla_cors"
+import "zilla_upload"
+import "zilla_ws"
+
+// New creates an App — zilla.New(8080) is the entry point.
+pub fn New(port: int) -> zilla_app.App {
+    return zilla_app.New(port)
+}

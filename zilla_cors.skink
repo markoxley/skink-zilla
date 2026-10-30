@@ -1,0 +1,129 @@
+// File:    zilla_cors.skink
+// Purpose: CORS (Cross-Origin Resource Sharing) middleware for
+//          skink-zilla. Configured with allowed origins, methods,
+//          headers, credentials flag, and preflight max-age. OPTIONS
+//          preflight requests are answered directly; normal requests
+//          get Access-Control-* headers injected on the response.
+module zilla_cors
+
+import "std/str"
+import "zilla_ctx"
+import "zilla_app"
+
+// Config describes an allowed CORS policy.
+pub struct Config {
+    Origins:     string // comma/space-separated origins or "*"
+    Methods:     string // e.g. "GET,POST,PUT,DELETE,OPTIONS"
+    Headers:     string // e.g. "Content-Type,Authorization"
+    Credentials: bool
+    MaxAge:      int    // seconds; 0 → omit
+}
+
+// DefaultConfig is the permissive development policy.
+pub fn DefaultConfig() -> Config {
+    return Config{
+        Origins: "*", Methods: "GET,POST,PUT,PATCH,DELETE,OPTIONS",
+        Headers: "Origin,Content-Type,Accept,Authorization",
+        Credentials: false, MaxAge: 86400,
+    }
+}
+
+// originAllowed reports whether the request origin matches the policy.
+// With Credentials, "*" is not a valid literal — echo the origin.
+fn originAllowed(cfg: Config, origin: string) -> (string, bool) {
+    if str.Len(origin) == 0 {
+        return "", false
+    }
+    if str.Equal(str.Trim(cfg.Origins), "*") {
+        if cfg.Credentials {
+            return origin, true   // spec: echo, not "*", with credentials
+        }
+        return "*", true
+    }
+    // exact match against comma/space list
+    norm := str.Replace(cfg.Origins, ",", " ")
+    parts := str.Split(norm, " ")
+    for i := 0; i < len(parts); i = i + 1 {
+        if str.Equal(str.Trim(parts[i]), origin) {
+            return origin, true
+        }
+    }
+    return "", false
+}
+
+// Middleware returns the skink-zilla middleware for a CORS config.
+pub fn Middleware(cfg: Config) -> fn(fn(*zilla_ctx.Ctx)) -> fn(*zilla_ctx.Ctx) {
+    return fn(next: fn(*zilla_ctx.Ctx)) -> fn(*zilla_ctx.Ctx) {
+        return fn(c: *zilla_ctx.Ctx) {
+            origin := zilla_ctx.Header(c, "Origin")
+            allow, ok := originAllowed(cfg, origin)
+            if ok {
+                zilla_ctx.Set(c, "Access-Control-Allow-Origin", allow)
+                if !str.Equal(allow, "*") {
+                    zilla_ctx.Set(c, "Vary", "Origin")
+                }
+                if cfg.Credentials {
+                    zilla_ctx.Set(c, "Access-Control-Allow-Credentials", "true")
+                }
+            }
+            // preflight
+            if str.Equal(zilla_ctx.Method(c), "OPTIONS") &&
+                str.Len(zilla_ctx.Header(c, "Access-Control-Request-Method")) > 0 {
+                if ok {
+                    zilla_ctx.Set(c, "Access-Control-Allow-Methods", cfg.Methods)
+                    zilla_ctx.Set(c, "Access-Control-Allow-Headers", cfg.Headers)
+                    if cfg.MaxAge > 0 {
+                        zilla_ctx.Set(c, "Access-Control-Max-Age", itoa(cfg.MaxAge))
+                    }
+                }
+                zilla_ctx.SendStatus(c, 204)
+                return
+            }
+            next(c)
+        }
+    }
+}
+
+// itoa local copy (avoids strconv dependency).
+fn itoa(n: int) -> string {
+    if n == 0 {
+        return "0"
+    }
+    s := ""
+    m := n
+    for m > 0 {
+        s = str.Concat(str.Substr("0123456789", m % 10, 1), s)
+        m = m / 10
+    }
+    return s
+}
+
+// Install registers both halves of CORS handling on an App:
+//   1. the response-header middleware (UseWeb) for matched routes, and
+//   2. an `OPTIONS /*` catch-all preflight handler — std/web's router
+//      404s unmatched requests before middleware runs, so a catch-all
+//      is the only way preflights reach CORS logic.
+// The catch-all is registered LAST so specific OPTIONS routes still win
+// where the router's exact-match runs before the wildcard check.
+pub fn Install(a: *zilla_app.App, cfg: Config) {
+    zilla_app.UseWeb(a, Middleware(cfg))
+    zilla_app.Options(a, "/*", fn(c: *zilla_ctx.Ctx) {
+        origin := zilla_ctx.Header(c, "Origin")
+        allow, ok := originAllowed(cfg, origin)
+        if ok {
+            zilla_ctx.Set(c, "Access-Control-Allow-Origin", allow)
+            if !str.Equal(allow, "*") {
+                zilla_ctx.Set(c, "Vary", "Origin")
+            }
+            if cfg.Credentials {
+                zilla_ctx.Set(c, "Access-Control-Allow-Credentials", "true")
+            }
+            zilla_ctx.Set(c, "Access-Control-Allow-Methods", cfg.Methods)
+            zilla_ctx.Set(c, "Access-Control-Allow-Headers", cfg.Headers)
+            if cfg.MaxAge > 0 {
+                zilla_ctx.Set(c, "Access-Control-Max-Age", itoa(cfg.MaxAge))
+            }
+        }
+        zilla_ctx.SendStatus(c, 204)
+    })
+}

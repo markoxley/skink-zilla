@@ -1,0 +1,186 @@
+// File:    zilla_session.skink
+// Purpose: Cookie-based server-side sessions for skink-zilla. A Session
+//          is a server-side string map keyed by a random 128-bit ID
+//          stored in a cookie (default "skink_sid"). The store is
+//          mutex-guarded and expires entries after a TTL; expiry is
+//          checked lazily on access.
+module zilla_session
+
+import "std/str"
+import "std/sync"
+import "std/time"
+import "std/libc"
+import "zilla_ctx"
+
+// libcrypto CSPRNG — session ids must not come from a reproducible
+// PRNG (an attacker who learns the seed state could forge them).
+extern fn RAND_bytes(buf: string, num: int) -> int
+
+// Session is a handle over one session's key→value map.
+pub struct Session {
+    id:      string
+    store:   *Store
+}
+
+// SessData is one session's key→value map, boxed behind a pointer so
+// Store.data stays map[string]*SessData — nested map values
+// (map[string]map[string]string) hit an emitter gap where the inner
+// map's LLVM type declaration is never emitted.
+pub struct SessData {
+    kv: map[string]string
+}
+
+// Store holds all live sessions.
+pub struct Store {
+    mu:      *sync.Mutex
+    data:    map[string]*SessData          // sid → boxed kv map
+    expiry:  map[string]int64              // sid → unix expiry
+    ttl:     int64                         // seconds
+    cookie:  string                        // cookie name
+}
+
+// NewStore creates a session store with a TTL (seconds) and cookie
+// name ("" → "skink_sid").
+pub fn NewStore(ttlSecs: int64, cookieName: string) -> Store {
+    name := cookieName
+    if str.Len(name) == 0 {
+        name = "skink_sid"
+    }
+    return Store{
+        mu: sync.NewMutex(), ttl: ttlSecs, cookie: name,
+        data: make(map[string]*SessData),
+        expiry: make(map[string]int64),
+    }
+}
+
+// newSID returns a random hex session id (128 bits from the CSPRNG).
+fn newSID() -> string {
+    buf := libc.malloc(16)
+    if RAND_bytes(buf, 16) != 1 {
+        // Fail rather than emit a guessable id.
+        libc.free(buf)
+        return ""
+    }
+    digits := "0123456789abcdef"
+    out := libc.malloc(33)
+    for i := 0; i < 16; i = i + 1 {
+        c := int(buf[i]) & 255
+        out[i * 2] = int(digits[c >> 4])
+        out[i * 2 + 1] = int(digits[c & 15])
+    }
+    out[32] = 0
+    libc.free(buf)
+    return out
+}
+
+// freshOrExisting loads the session for ctx's cookie, or creates one.
+fn loadSession(s: *Store, c: *zilla_ctx.Ctx) -> Session {
+    sid := zilla_ctx.Cookie(c, s.cookie)
+    now := time.Now().Unix()
+    s.mu.Lock()
+    if str.Len(sid) > 0 {
+        exp, ok := s.expiry[sid]
+        _, hasData := s.data[sid]
+        if ok && hasData && exp > now {
+            s.expiry[sid] = now + s.ttl   // sliding TTL
+            s.mu.Unlock()
+            return Session{id: sid, store: s}
+        }
+        if ok || hasData {
+            // expired — purge
+            delete(s.data, sid)
+            delete(s.expiry, sid)
+        }
+    }
+    sid = newSID()
+    s.data[sid] = &SessData{kv: make(map[string]string)}
+    s.expiry[sid] = now + s.ttl
+    s.mu.Unlock()
+    return Session{id: sid, store: s}
+}
+
+// Get returns the session for this request, creating + setting the
+// cookie when none exists. Call once at handler start; the id is
+// stable for the request.
+pub fn Get(s: *Store, c: *zilla_ctx.Ctx) -> Session {
+    sess := loadSession(s, c)
+    // always (re)set the cookie so the TTL slides
+    zilla_ctx.SetCookie(c, s.cookie, sess.id, int(s.ttl), "/", true)
+    return sess
+}
+
+// SGet reads a session key.
+pub fn SGet(sess: *Session, key: string) -> string {
+    sess.store.mu.Lock()
+    m, ok := sess.store.data[sess.id]
+    if !ok {
+        sess.store.mu.Unlock()
+        return ""
+    }
+    v, ok2 := m.kv[key]
+    sess.store.mu.Unlock()
+    if ok2 {
+        return v
+    }
+    return ""
+}
+
+// SSet writes a session key.
+pub fn SSet(sess: *Session, key: string, value: string) {
+    sess.store.mu.Lock()
+    m, ok := sess.store.data[sess.id]
+    if ok {
+        m.kv[key] = value
+    }
+    sess.store.mu.Unlock()
+}
+
+// SDel removes a session key.
+pub fn SDel(sess: *Session, key: string) {
+    sess.store.mu.Lock()
+    m, ok := sess.store.data[sess.id]
+    if ok {
+        delete(m.kv, key)
+    }
+    sess.store.mu.Unlock()
+}
+
+// Destroy removes the whole session and clears the cookie.
+pub fn Destroy(sess: *Session, c: *zilla_ctx.Ctx) {
+    sess.store.mu.Lock()
+    delete(sess.store.data, sess.id)
+    delete(sess.store.expiry, sess.id)
+    sess.store.mu.Unlock()
+    zilla_ctx.ClearCookie(c, sess.store.cookie, "/")
+}
+
+// Regenerate assigns a new id (anti-fixation) keeping the data.
+pub fn Regenerate(sess: *Session, c: *zilla_ctx.Ctx) {
+    s := sess.store
+    now := time.Now().Unix()
+    s.mu.Lock()
+    m, ok := s.data[sess.id]
+    if ok {
+        delete(s.data, sess.id)
+        delete(s.expiry, sess.id)
+        nid := newSID()
+        s.data[nid] = m
+        s.expiry[nid] = now + s.ttl
+        sess.id = nid
+    }
+    s.mu.Unlock()
+    zilla_ctx.SetCookie(c, s.cookie, sess.id, int(s.ttl), "/", true)
+}
+
+// SID returns the session id (for tests and cookie inspection).
+pub fn SID(sess: *Session) -> string {
+    return sess.id
+}
+
+// Count returns the number of live sessions (diagnostics/tests).
+pub fn Count(s: *Store) -> int {
+    s.mu.Lock()
+    n := len(s.data)
+    s.mu.Unlock()
+    return n
+}

@@ -1,0 +1,111 @@
+// File:    zilla_ratelimit.skink
+// Purpose: Fixed-window rate limiting middleware for skink-zilla. A
+//          Limiter counts requests per key (default: client IP) inside
+//          a sliding window; beyond `max` in `windowSecs` the wrapped
+//          handler is short-circuited with 429 + Retry-After. The map
+//          of counters is mutex-guarded (handlers run per-connection).
+module zilla_ratelimit
+
+import "std/str"
+import "std/sync"
+import "std/time"
+import "std/strconv"
+import "zilla_ctx"
+
+// bucket is one key's window state.
+struct bucket {
+    windowStart: int64
+    count:       int
+}
+
+// Limiter is a per-key fixed-window rate limiter.
+pub struct Limiter {
+    Max:        int    // requests allowed per window
+    WindowSecs: int64  // window length
+    mu:         *sync.Mutex
+    buckets:    map[string]int64 // key → packed windowStart*1e6+count…
+    // kept simple: two parallel maps
+    starts:     map[string]int64
+    counts:     map[string]int
+}
+
+// NewLimiter creates a limiter: max requests per windowSecs per key.
+pub fn NewLimiter(max: int, windowSecs: int64) -> Limiter {
+    return Limiter{
+        Max: max, WindowSecs: windowSecs, mu: sync.NewMutex(),
+        buckets: make(map[string]int64),
+        starts:  make(map[string]int64),
+        counts:  make(map[string]int),
+    }
+}
+
+// allow reports whether key may proceed; resets the window when stale.
+// Returns (allowed, retryAfterSecs).
+fn allow(l: *Limiter, key: string) -> (bool, int) {
+    now := time.Now().Unix()
+    l.mu.Lock()
+    // The maps grow one entry per distinct key — without eviction an
+    // attacker spraying unique IPs/headers could exhaust memory. Sweep
+    // dead windows once the table is large.
+    if len(l.starts) > 65536 {
+        for k, ws in l.starts {
+            if now - ws >= l.WindowSecs {
+                delete(l.starts, k)
+                delete(l.counts, k)
+            }
+        }
+    }
+    start, ok := l.starts[key]
+    cnt := 0
+    if ok {
+        cnt = l.counts[key]
+        if now - start >= l.WindowSecs {
+            // window rolled
+            start = now
+            cnt = 0
+        }
+    } else {
+        start = now
+    }
+    if cnt >= l.Max {
+        retry := int(l.WindowSecs - (now - start))
+        if retry < 1 {
+            retry = 1
+        }
+        l.mu.Unlock()
+        return false, retry
+    }
+    l.starts[key] = start
+    l.counts[key] = cnt + 1
+    l.mu.Unlock()
+    return true, 0
+}
+
+// KeyFunc extracts the rate-limit key from a ctx — default is client
+// IP; use a custom fn for per-user/per-token limiting.
+// (Declared via canonical fn type — no alias.)
+//
+// Middleware returns a skink-zilla middleware wrapping `next`:
+//     app.UseWeb(zilla_ratelimit.Middleware(&limiter, ""))
+// keyHeader, when non-empty, is a request header used as the key
+// instead of the client IP (e.g. "x-api-key").
+pub fn Middleware(l: *Limiter, keyHeader: string) -> fn(fn(*zilla_ctx.Ctx)) -> fn(*zilla_ctx.Ctx) {
+    return fn(next: fn(*zilla_ctx.Ctx)) -> fn(*zilla_ctx.Ctx) {
+        return fn(c: *zilla_ctx.Ctx) {
+            key := zilla_ctx.IP(c)
+            if str.Len(keyHeader) > 0 {
+                key = zilla_ctx.Header(c, keyHeader)
+            }
+            if str.Len(key) == 0 {
+                key = "unknown"
+            }
+            ok, retry := allow(l, key)
+            if !ok {
+                zilla_ctx.Set(c, "Retry-After", strconv.Itoa64(int64(retry)))
+                zilla_ctx.SendStatus(c, 429)
+                return
+            }
+            next(c)
+        }
+    }
+}

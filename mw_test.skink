@@ -1,0 +1,328 @@
+// File:    mw_test.skink
+// Purpose: Unit tests for skink-zilla ctx/app/middleware layers that run
+//          entirely in-process: Ctx accessors, cookies, Locals,
+//          sessions, CORS headers + preflight, rate limiting, JWT
+//          authz middleware, multipart upload parsing, route groups.
+//          Requests are fabricated via types.NewRequest and dispatched
+//          through Router.ServeHTTP — no sockets.
+module mw_test
+
+import "zilla_ctx"
+import "zilla_app"
+import "zilla_jwt"
+import "zilla_session"
+import "zilla_authz"
+import "zilla_ratelimit"
+import "zilla_cors"
+import "zilla_upload"
+import "std/web/types"
+import "std/web/server"
+import "std/str"
+import "std/json"
+import "std/testing"
+
+// mkreq builds a GET request with headers.
+fn mkreq(path: string, hdrs: map[string]string) -> types.Request {
+    return types.NewRequest("GET", path, "", hdrs, "")
+}
+
+// TestCtxAccessors covers path/query/param/header access.
+pub fn TestCtxAccessors() {
+    hdrs := make(map[string]string)
+    hdrs["x-test"] = "v1"
+    req := types.NewRequest("POST", "/users/42", "q=hello&empty=", hdrs, "body-text")
+    w := types.NewResponseWriter()
+    c := zilla_ctx.NewCtx(req, w)
+    testing.AssertEqualString("POST", zilla_ctx.Method(&c), "method")
+    testing.AssertEqualString("/users/42", zilla_ctx.Path(&c), "path")
+    testing.AssertEqualString("hello", zilla_ctx.Query(&c, "q"), "query q")
+    testing.AssertEqualString("fb", zilla_ctx.QueryDefault(&c, "missing", "fb"), "query default")
+    testing.AssertEqualString("v1", zilla_ctx.Header(&c, "X-Test"), "header case-insens")
+    testing.AssertEqualString("body-text", zilla_ctx.Body(&c), "body")
+    zilla_ctx.SetLocal(&c, "k", "v")
+    testing.AssertEqualString("v", zilla_ctx.Local(&c, "k"), "locals")
+}
+
+// TestCookies covers Set-Cookie emission + request-cookie parsing.
+pub fn TestCookies() {
+    hdrs := make(map[string]string)
+    hdrs["cookie"] = "a=1; sid=abc%20def; theme=dark"
+    c := zilla_ctx.NewCtx(mkreq("/", hdrs), types.NewResponseWriter())
+    testing.AssertEqualString("abc def", zilla_ctx.Cookie(&c, "sid"), "url-decoded cookie")
+    testing.AssertEqualString("1", zilla_ctx.Cookie(&c, "a"), "cookie a")
+    testing.AssertEqualString("", zilla_ctx.Cookie(&c, "nope"), "missing cookie")
+
+    zilla_ctx.SetCookie(&c, "sess", "tok123", 3600, "/", true)
+    // headers land in the serialized response
+    wire := server.SerializeResponse(*c.Res)
+    testing.AssertContains(wire, "sess=tok123", "set-cookie value")
+    testing.AssertContains(wire, "HttpOnly", "httponly flag")
+}
+
+// TestSendHelpers covers Status/JSON/Text helpers writing to the
+// ResponseWriter.
+pub fn TestSendHelpers() {
+    c := zilla_ctx.NewCtx(mkreq("/", make(map[string]string)), types.NewResponseWriter())
+    zilla_ctx.JSON(&c, 201, "{\"ok\":true}")
+    testing.AssertEqualInt(201, c.Res.Status(), "json status")
+    testing.AssertContains(c.Res.ResponseBody(), "ok", "json body")
+
+    c2 := zilla_ctx.NewCtx(mkreq("/", make(map[string]string)), types.NewResponseWriter())
+    zilla_ctx.SendStatus(&c2, 404)
+    testing.AssertEqualInt(404, c2.Res.Status(), "sendstatus")
+    testing.AssertContains(c2.Res.ResponseBody(), "Not Found", "sendstatus body")
+}
+
+// echoH echoes back a marker so middleware tests can tell whether the
+// inner handler ran.
+fn echoH(c: *zilla_ctx.Ctx) {
+    zilla_ctx.Text(c, 200, str.Concat("inner:", zilla_ctx.Local(c, "marker")))
+}
+
+// TestGroupRouting checks prefix + group middleware.
+pub fn TestGroupRouting() {
+    app := zilla_app.New(0)
+    g := zilla_app.GroupAt(&app, "/api")
+    zilla_app.GroupUse(&g, fn(next: fn(*zilla_ctx.Ctx)) -> fn(*zilla_ctx.Ctx) {
+        return fn(c: *zilla_ctx.Ctx) {
+            zilla_ctx.SetLocal(c, "marker", "groupmw")
+            next(c)
+        }
+    })
+    zilla_app.GroupGet(&g, "/ping", echoH)
+
+    w := types.NewResponseWriter()
+    app.R.ServeHTTP(mkreq("/api/ping", make(map[string]string)), w)
+    testing.AssertEqualInt(200, w.Status(), "group route status")
+    testing.AssertEqualString("inner:groupmw", w.ResponseBody(), "group mw ran")
+
+    w2 := types.NewResponseWriter()
+    app.R.ServeHTTP(mkreq("/nope", make(map[string]string)), w2)
+    testing.AssertEqualInt(404, w2.Status(), "unmatched 404")
+}
+
+// TestUseWebRequestTime proves app.UseWeb middleware applies even to
+// routes registered BEFORE the middleware (request-time composition).
+pub fn TestUseWebRequestTime() {
+    app := zilla_app.New(0)
+    zilla_app.Get(&app, "/x", echoH)
+    zilla_app.UseWeb(&app, fn(next: fn(*zilla_ctx.Ctx)) -> fn(*zilla_ctx.Ctx) {
+        return fn(c: *zilla_ctx.Ctx) {
+            zilla_ctx.SetLocal(c, "marker", "latemw")
+            next(c)
+        }
+    })
+    w := types.NewResponseWriter()
+    app.R.ServeHTTP(mkreq("/x", make(map[string]string)), w)
+    testing.AssertEqualString("inner:latemw", w.ResponseBody(), "late mw still applied")
+}
+
+// TestCors covers header injection and preflight handling.
+pub fn TestCors() {
+    app := zilla_app.New(0)
+    zilla_cors.Install(&app, zilla_cors.DefaultConfig())
+    zilla_app.Get(&app, "/data", echoH)
+
+    hdrs := make(map[string]string)
+    hdrs["origin"] = "https://example.com"
+    w := types.NewResponseWriter()
+    app.R.ServeHTTP(mkreq("/data", hdrs), w)
+    testing.AssertEqualInt(200, w.Status(), "cors simple")
+
+    // preflight — fabricate via header map (NewRequest lowercases keys)
+    ph := make(map[string]string)
+    ph["origin"] = "https://a.com"
+    ph["access-control-request-method"] = "POST"
+    req2 := types.NewRequest("OPTIONS", "/data", "", ph, "")
+    w2 := types.NewResponseWriter()
+    app.R.ServeHTTP(req2, w2)
+    testing.AssertEqualInt(204, w2.Status(), "preflight 204")
+}
+
+// TestRateLimit blocks beyond the cap.
+pub fn TestRateLimit() {
+    lim := zilla_ratelimit.NewLimiter(2, int64(60))
+    app := zilla_app.New(0)
+    zilla_app.UseWeb(&app, zilla_ratelimit.Middleware(&lim, "x-api-key"))
+    zilla_app.Get(&app, "/hit", echoH)
+
+    hdrs := make(map[string]string)
+    hdrs["x-api-key"] = "client1"
+    codes := ""
+    for i := 0; i < 4; i = i + 1 {
+        w := types.NewResponseWriter()
+        app.R.ServeHTTP(mkreq("/hit", hdrs), w)
+        codes = str.Concat(codes, str.Concat(strconvItoa(w.Status()), ","))
+    }
+    testing.AssertEqualString("200,200,429,429,", codes, "limiter caps")
+
+    // different key → independent budget
+    hdrs["x-api-key"] = "client2"
+    w := types.NewResponseWriter()
+    app.R.ServeHTTP(mkreq("/hit", hdrs), w)
+    testing.AssertEqualInt(200, w.Status(), "separate key allowed")
+}
+
+fn strconvItoa(n: int) -> string {
+    s := ""
+    m := n
+    if m == 0 {
+        return "0"
+    }
+    for m > 0 {
+        s = str.Concat(str.Substr("0123456789", m % 10, 1), s)
+        m = m / 10
+    }
+    return s
+}
+
+// TestSessions covers create/read/write/regenerate/destroy.
+pub fn TestSessions() {
+    store := zilla_session.NewStore(int64(3600), "")
+    hdrs := make(map[string]string)
+    c := zilla_ctx.NewCtx(mkreq("/", hdrs), types.NewResponseWriter())
+    sess := zilla_session.Get(&store, &c)
+    zilla_session.SSet(&sess, "user", "ada")
+    testing.AssertEqualString("ada", zilla_session.SGet(&sess, "user"), "session set/get")
+    testing.AssertEqualInt(1, zilla_session.Count(&store), "one session")
+
+    // cookie was set on the response; simulate a follow-up request
+    sid := zilla_session.SID(&sess)
+    hdrs2 := make(map[string]string)
+    hdrs2["cookie"] = str.Concat("skink_sid=", sid)
+    c2 := zilla_ctx.NewCtx(mkreq("/", hdrs2), types.NewResponseWriter())
+    sess2 := zilla_session.Get(&store, &c2)
+    testing.AssertEqualString("ada", zilla_session.SGet(&sess2, "user"), "session persists by cookie")
+    testing.AssertEqualString(sid, zilla_session.SID(&sess2), "same sid")
+
+    zilla_session.Regenerate(&sess2, &c2)
+    testing.AssertTrue(!str.Equal(zilla_session.SID(&sess2), sid), "regen new id")
+    testing.AssertEqualString("ada", zilla_session.SGet(&sess2, "user"), "data kept on regen")
+
+    zilla_session.Destroy(&sess2, &c2)
+    testing.AssertEqualInt(0, zilla_session.Count(&store), "destroyed")
+    testing.AssertEqualString("", zilla_session.SGet(&sess2, "user"), "gone")
+}
+
+// TestAuthz covers the RequireAuth/RequireRole middleware end-to-end.
+pub fn TestAuthz() {
+    secret := "shh"
+    app := zilla_app.New(0)
+    zilla_app.UseWeb(&app, zilla_authz.RequireAuth(secret))
+    g := zilla_app.GroupAt(&app, "/admin")
+    zilla_app.GroupUse(&g, zilla_authz.RequireRole("admin"))
+    zilla_app.GroupGet(&g, "/panel", echoH)
+
+    // no token → 401
+    w := types.NewResponseWriter()
+    app.R.ServeHTTP(mkreq("/admin/panel", make(map[string]string)), w)
+    testing.AssertEqualInt(401, w.Status(), "no token 401")
+
+    // token without admin role → 403
+    tokUser := zilla_jwt.Sign("{\"sub\":\"u\",\"roles\":\"user\"}", secret, int64(3600))
+    hu := make(map[string]string)
+    hu["authorization"] = str.Concat("Bearer ", tokUser)
+    w2 := types.NewResponseWriter()
+    app.R.ServeHTTP(mkreq("/admin/panel", hu), w2)
+    testing.AssertEqualInt(403, w2.Status(), "non-admin 403")
+
+    // admin token → 200 + claims in Locals
+    tokAdmin := zilla_jwt.Sign("{\"sub\":\"root\",\"roles\":\"admin\"}", secret, int64(3600))
+    ha := make(map[string]string)
+    ha["authorization"] = str.Concat("Bearer ", tokAdmin)
+    w3 := types.NewResponseWriter()
+    app.R.ServeHTTP(mkreq("/admin/panel", ha), w3)
+    testing.AssertEqualInt(200, w3.Status(), "admin 200")
+}
+
+// TestAuthzArrayRoles checks JSON-array roles claims.
+pub fn TestAuthzArrayRoles() {
+    secret := "k"
+    app := zilla_app.New(0)
+    zilla_app.UseWeb(&app, zilla_authz.RequireAuth(secret))
+    zilla_app.UseWeb(&app, zilla_authz.RequireRole("ops"))
+    zilla_app.Get(&app, "/ops", echoH)
+
+    tok := zilla_jwt.Sign("{\"sub\":\"o\",\"roles\":[\"ops\",\"dev\"]}", secret, int64(3600))
+    h := make(map[string]string)
+    h["authorization"] = str.Concat("Bearer ", tok)
+    w := types.NewResponseWriter()
+    app.R.ServeHTTP(mkreq("/ops", h), w)
+    testing.AssertEqualInt(200, w.Status(), "array role ok")
+}
+
+// TestUpload parses a multipart body with a text field and a file.
+pub fn TestUpload() {
+    bnd := "X-BOUNDARY-1"
+    body := str.Concat("--X-BOUNDARY-1\r\n",
+        str.Concat("Content-Disposition: form-data; name=\"title\"\r\n\r\n",
+        str.Concat("Hello World\r\n",
+        str.Concat("--X-BOUNDARY-1\r\n",
+        str.Concat("Content-Disposition: form-data; name=\"doc\"; filename=\"a.txt\"\r\n",
+        str.Concat("Content-Type: text/plain\r\n\r\n",
+        str.Concat("file-contents-here\r\n",
+        str.Concat("--X-BOUNDARY-1--\r\n", ""))))))))
+    hdrs := make(map[string]string)
+    hdrs["content-type"] = str.Concat("multipart/form-data; boundary=", bnd)
+    req := types.NewRequest("POST", "/upload", "", hdrs, body)
+    c := zilla_ctx.NewCtx(req, types.NewResponseWriter())
+
+    testing.AssertEqualString("Hello World", zilla_upload.FormValue(&c, "title"), "text field")
+    part, ok := zilla_upload.FormFile(&c, "doc")
+    testing.AssertTrue(ok, "file found")
+    testing.AssertEqualString("a.txt", part.Filename, "filename")
+    testing.AssertEqualString("file-contents-here", part.Data, "file bytes")
+    testing.AssertEqualInt(18, part.DataLen, "file len")
+}
+
+// TestUploadBad verifies bad content types are rejected.
+pub fn TestUploadBad() {
+    req := types.NewRequest("POST", "/u", "", make(map[string]string), "x")
+    c := zilla_ctx.NewCtx(req, types.NewResponseWriter())
+    _, err := zilla_upload.MultipartForm(&c)
+    testing.AssertTrue(str.Len(err.message) > 0, "no boundary rejected")
+    testing.AssertEqualString("", zilla_upload.FormValue(&c, "x"), "formvalue empty")
+}
+
+// TestUploadBoundaryParams — regression: the boundary token must stop
+// at the next ';' — a Content-Type with trailing params previously
+// dragged them into the marker so no part ever matched.
+pub fn TestUploadBoundaryParams() {
+    body := str.Concat("--BB\r\n",
+        str.Concat("Content-Disposition: form-data; name=\"t\"\r\n\r\n",
+        str.Concat("v\r\n--BB--\r\n", "")))
+    hdrs := make(map[string]string)
+    hdrs["content-type"] = "multipart/form-data; boundary=BB; charset=utf-8"
+    c := zilla_ctx.NewCtx(types.NewRequest("POST", "/u", "", hdrs, body),
+        types.NewResponseWriter())
+    testing.AssertEqualString("v", zilla_upload.FormValue(&c, "t"), "trailing-param boundary")
+}
+
+// TestIpRemoteAddrWins — regression: the real socket peer (server
+// populated, unforgeable — comp_error.md #146) must outrank both the
+// remote_addr header and X-Forwarded-For; XFF's first hop is the last
+// fallback.
+pub fn TestIpRemoteAddrWins() {
+    hdrs := make(map[string]string)
+    hdrs["remote_addr"] = "10.0.0.9:4444"
+    hdrs["x-forwarded-for"] = "1.2.3.4, 5.6.7.8"
+    c := zilla_ctx.NewCtx(mkreq("/", hdrs), types.NewResponseWriter())
+    testing.AssertEqualString("10.0.0.9:4444", zilla_ctx.IP(&c), "peer beats forged xff")
+    hdrs2 := make(map[string]string)
+    hdrs2["x-forwarded-for"] = "1.2.3.4, 5.6.7.8"
+    c2 := zilla_ctx.NewCtx(mkreq("/", hdrs2), types.NewResponseWriter())
+    testing.AssertEqualString("1.2.3.4", zilla_ctx.IP(&c2), "xff first hop fallback")
+}
+
+// TestIpPeerFieldWins — regression for comp_error.md #146: when the
+// server records the socket peer on the Request it beats every header,
+// forged or not.
+pub fn TestIpPeerFieldWins() {
+    hdrs := make(map[string]string)
+    hdrs["remote_addr"] = "9.9.9.9:1"
+    hdrs["x-forwarded-for"] = "1.2.3.4"
+    req := types.NewRequest("GET", "/", "", hdrs, "")
+    req.SetPeer("127.0.0.1:7777")
+    c := zilla_ctx.NewCtx(req, types.NewResponseWriter())
+    testing.AssertEqualString("127.0.0.1:7777", zilla_ctx.IP(&c), "socket peer wins")
+}
