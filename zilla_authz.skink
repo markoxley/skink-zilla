@@ -13,6 +13,12 @@ import "std/json"
 import "zilla_ctx"
 import "zilla_jwt"
 
+// Raw byte accessors for binary buffers — string indexing is
+// bounds-checked against strlen, which truncates at the first NUL byte.
+extern fn Skink_mem_byte(ptr: string, idx: int64) -> int
+extern fn Skink_mem_write_byte(ptr: string, idx: int64, val: int)
+
+
 // LOC_CLAIMS is the Locals key holding the verified claims JSON.
 pub const LOC_CLAIMS = "zilla.jwt_claims"
 

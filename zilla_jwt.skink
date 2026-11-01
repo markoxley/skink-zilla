@@ -15,6 +15,12 @@ import "std/crypto"
 import "std/time"
 import "std/strconv"
 
+// Raw byte accessors for binary buffers — string indexing is
+// bounds-checked against strlen, which truncates at the first NUL byte.
+extern fn Skink_mem_byte(ptr: string, idx: int64) -> int
+extern fn Skink_mem_write_byte(ptr: string, idx: int64, val: int)
+
+
 // b64url encodes n bytes of data as unpadded base64url.
 fn b64url(data: string, n: int) -> string {
     s := base64.Encode(data, n)
@@ -23,7 +29,7 @@ fn b64url(data: string, n: int) -> string {
     // strip '=' padding
     out := ""
     for i := 0; i < str.Len(s); i = i + 1 {
-        if s[i] != 61 { // '='
+        if Skink_mem_byte(s, int64(i)) != 61 { // '='
             out = str.Concat(out, str.Substr(s, i, 1))
         }
     }
@@ -69,7 +75,7 @@ fn claimWithTimes(claims: string, iat: int64, exp: int64) -> string {
     ins := str.Concat("\"iat\":", str.Concat(strconv.Itoa64(iat),
         str.Concat(",\"exp\":", strconv.Itoa64(exp))))
     t := str.Trim(claims)
-    if str.Len(t) >= 2 && t[0] == 123 { // '{'
+    if str.Len(t) >= 2 && Skink_mem_byte(t, 0) == 123 { // '{'
         rest := str.Substr(t, 1, str.Len(t) - 1)
         if str.Len(str.Trim(rest)) == 0 {
             return str.Concat("{", str.Concat(ins, "}"))
@@ -169,7 +175,7 @@ pub fn Verify(token: string, secret: string) -> (Claims, errors.Error) {
 fn constEq(a: string, b: string, n: int) -> bool {
     diff := 0
     for i := 0; i < n; i = i + 1 {
-        diff = diff | int(a[i] ^ b[i])
+        diff = diff | int(Skink_mem_byte(a, int64(i)) ^ Skink_mem_byte(b, int64(i)))
     }
     return diff == 0
 }

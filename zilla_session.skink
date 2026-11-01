@@ -12,6 +12,12 @@ import "std/time"
 import "std/libc"
 import "zilla_ctx"
 
+// Raw byte accessors for binary buffers — string indexing is
+// bounds-checked against strlen, which truncates at the first NUL byte.
+extern fn Skink_mem_byte(ptr: string, idx: int64) -> int
+extern fn Skink_mem_write_byte(ptr: string, idx: int64, val: int)
+
+
 // libcrypto CSPRNG — session ids must not come from a reproducible
 // PRNG (an attacker who learns the seed state could forge them).
 extern fn RAND_bytes(buf: string, num: int) -> int
@@ -64,11 +70,11 @@ fn newSID() -> string {
     digits := "0123456789abcdef"
     out := libc.malloc(33)
     for i := 0; i < 16; i = i + 1 {
-        c := int(buf[i]) & 255
-        out[i * 2] = int(digits[c >> 4])
-        out[i * 2 + 1] = int(digits[c & 15])
+        c := Skink_mem_byte(buf, int64(i)) & 255
+        Skink_mem_write_byte(out, int64(i * 2), int(digits[c >> 4]))
+        Skink_mem_write_byte(out, int64(i * 2 + 1), int(digits[c & 15]))
     }
-    out[32] = 0
+    Skink_mem_write_byte(out, int64(32), 0)
     libc.free(buf)
     return out
 }

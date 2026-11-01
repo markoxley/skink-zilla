@@ -14,6 +14,12 @@ import "std/errors"
 import "std/libc"
 import "zilla_ctx"
 
+// Raw byte accessors for binary buffers — string indexing is
+// bounds-checked against strlen, which truncates at the first NUL byte.
+extern fn Skink_mem_byte(ptr: string, idx: int64) -> int
+extern fn Skink_mem_write_byte(ptr: string, idx: int64, val: int)
+
+
 // Part is one parsed multipart section.
 pub struct Part {
     Name:     string // field name
@@ -48,7 +54,7 @@ fn boundaryOf(ct: string) -> string {
     // marker and every split would miss.
     end := str.Len(b)
     for i := 0; i < end; i = i + 1 {
-        c := b[i]
+        c := Skink_mem_byte(b, int64(i))
         if c == 59 || c == 32 || c == 9 { // ';' ' ' '\t'
             end = i
             break
@@ -56,7 +62,7 @@ fn boundaryOf(ct: string) -> string {
     }
     b = str.Substr(b, 0, end)
     // strip optional quotes
-    if str.Len(b) >= 2 && b[0] == 34 && b[str.Len(b) - 1] == 34 {
+    if str.Len(b) >= 2 && Skink_mem_byte(b, int64(0)) == 34 && Skink_mem_byte(b, int64(str.Len(b) - 1)) == 34 {
         b = str.Substr(b, 1, str.Len(b) - 2)
     }
     return b
@@ -69,7 +75,7 @@ fn byteSlice(s: string, off: int, n: int) -> string {
     if n > 0 {
         libc.memcpy(out, string(int64(s) + int64(off)), n)
     }
-    out[n] = 0
+    Skink_mem_write_byte(out, int64(n), 0)
     return out
 }
 
@@ -84,7 +90,7 @@ fn findSub(hay: string, hayLen: int, needle: string, startAt: int) -> int {
     for i + nlen <= hayLen {
         hit := true
         for j := 0; j < nlen; j = j + 1 {
-            if hay[i + j] != needle[j] {
+            if Skink_mem_byte(hay, int64(i + j)) != Skink_mem_byte(needle, int64(j)) {
                 hit = false
                 break
             }
@@ -111,10 +117,10 @@ fn parseParts(body: string, blen: int, boundary: string) -> ([]Part, errors.Erro
 
     for pos < blen {
         // after marker: "--" = end, "\r\n" = next part
-        if pos + 2 <= blen && body[pos] == 45 && body[pos + 1] == 45 {
+        if pos + 2 <= blen && Skink_mem_byte(body, int64(pos)) == 45 && Skink_mem_byte(body, int64(pos + 1)) == 45 {
             break
         }
-        if pos + 2 <= blen && body[pos] == 13 && body[pos + 1] == 10 {
+        if pos + 2 <= blen && Skink_mem_byte(body, int64(pos)) == 13 && Skink_mem_byte(body, int64(pos + 1)) == 10 {
             pos = pos + 2
         }
         // headers end at \r\n\r\n

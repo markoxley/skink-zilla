@@ -267,6 +267,12 @@ pub fn Local(c: *Ctx, key: string) -> string {
 }
 
 // itoa is a local int→string (avoids strconv import noise).
+
+// Raw byte accessors for binary buffers — string indexing is
+// bounds-checked against strlen, which truncates at the first NUL byte.
+extern fn Skink_mem_byte(ptr: string, idx: int64) -> int
+extern fn Skink_mem_write_byte(ptr: string, idx: int64, val: int)
+
 fn itoa(n: int) -> string {
     if n == 0 {
         return "0"

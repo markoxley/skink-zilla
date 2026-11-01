@@ -20,6 +20,12 @@ import "std/time"
 import "std/errors"
 import "std/libc"
 
+// Raw byte accessors for binary buffers — string indexing is
+// bounds-checked against strlen, which truncates at the first NUL byte.
+extern fn Skink_mem_byte(ptr: string, idx: int64) -> int
+extern fn Skink_mem_write_byte(ptr: string, idx: int64, val: int)
+
+
 var failures = 0
 
 fn check(ok: bool, what: string) {
@@ -139,7 +145,7 @@ fn hasFullBody(resp: string) -> bool {
 fn atoi(s: string) -> int {
     n := 0
     for i := 0; i < str.Len(s); i = i + 1 {
-        c := int(s[i])
+        c := Skink_mem_byte(s, int64(i))
         if c >= 48 && c <= 57 {
             n = n * 10 + (c - 48)
         }
@@ -211,25 +217,25 @@ fn wsSendMask(c: *wsClient, op: int, data: string) {
         hlen = 4
     }
     out := libc.malloc(hlen + 4 + n)
-    out[0] = 0x80 | op
+    Skink_mem_write_byte(out, int64(0), 0x80 | op)
     if n < 126 {
-        out[1] = 0x80 | n
+        Skink_mem_write_byte(out, int64(1), 0x80 | n)
     } else {
-        out[1] = 0x80 | 126
-        out[2] = n >> 8
-        out[3] = n & 255
+        Skink_mem_write_byte(out, int64(1), 0x80 | 126)
+        Skink_mem_write_byte(out, int64(2), n >> 8)
+        Skink_mem_write_byte(out, int64(3), n & 255)
     }
     // fixed mask 0xAABBCCDD (test client)
-    out[hlen] = 0xAA
-    out[hlen + 1] = 0xBB
-    out[hlen + 2] = 0xCC
-    out[hlen + 3] = 0xDD
+    Skink_mem_write_byte(out, int64(hlen), 0xAA)
+    Skink_mem_write_byte(out, int64(hlen + 1), 0xBB)
+    Skink_mem_write_byte(out, int64(hlen + 2), 0xCC)
+    Skink_mem_write_byte(out, int64(hlen + 3), 0xDD)
     for i := 0; i < n; i = i + 1 {
         mk := 0xAA
         if i % 4 == 1 { mk = 0xBB }
         if i % 4 == 2 { mk = 0xCC }
         if i % 4 == 3 { mk = 0xDD }
-        out[hlen + 4 + i] = int(data[i]) ^ mk
+        Skink_mem_write_byte(out, int64(hlen + 4 + i), Skink_mem_byte(data, int64(i)) ^ mk)
     }
     c.conn.SendAll(out, hlen + 4 + n)
     libc.free(out)
@@ -248,7 +254,7 @@ fn readN(conn: *net.Connection, n: int) -> (string, bool) {
         libc.memcpy(string(int64(out) + int64(have)), chunk, str.Len(chunk))
         have = have + str.Len(chunk)
     }
-    out[n] = 0
+    Skink_mem_write_byte(out, int64(n), 0)
     return out, true
 }
 
@@ -258,14 +264,14 @@ fn wsRecv(c: *wsClient) -> (int, string) {
     if !ok {
         return -1, ""
     }
-    op := int(hdr[0]) & 0x0F
-    plen := int(hdr[1]) & 0x7F
+    op := Skink_mem_byte(hdr, int64(0)) & 0x0F
+    plen := Skink_mem_byte(hdr, int64(1)) & 0x7F
     if plen == 126 {
         ext, ok2 := readN(&c.conn, 2)
         if !ok2 {
             return -1, ""
         }
-        plen = (int(ext[0]) << 8) | int(ext[1])
+        plen = (Skink_mem_byte(ext, int64(0)) << 8) | Skink_mem_byte(ext, int64(1))
     }
     if plen == 0 {
         return op, ""

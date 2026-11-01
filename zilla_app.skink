@@ -19,6 +19,12 @@ import "std/web/server"
 import "std/web/static"
 import "zilla_ctx"
 
+// Raw byte accessors for binary buffers — string indexing is
+// bounds-checked against strlen, which truncates at the first NUL byte.
+extern fn Skink_mem_byte(ptr: string, idx: int64) -> int
+extern fn Skink_mem_write_byte(ptr: string, idx: int64, val: int)
+
+
 // Canonical web-middleware signature — used verbatim (not via a named
 // alias) because cross-module fn-type aliases do not unify:
 //   fn(fn(*zilla_ctx.Ctx)) -> fn(*zilla_ctx.Ctx)

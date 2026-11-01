@@ -13,6 +13,12 @@ import "std/json"
 import "std/time"
 import "std/testing"
 
+// Raw byte accessors for binary buffers — string indexing is
+// bounds-checked against strlen, which truncates at the first NUL byte.
+extern fn Skink_mem_byte(ptr: string, idx: int64) -> int
+extern fn Skink_mem_write_byte(ptr: string, idx: int64, val: int)
+
+
 // TestSignVerify checks a round-trip HS256 token.
 pub fn TestSignVerify() {
     tok := zilla_jwt.Sign("{\"sub\":\"ada\",\"roles\":\"admin,user\"}", "s3cret", int64(3600))
@@ -40,7 +46,7 @@ pub fn TestTamper() {
     d2 := str.IndexOf(rest, ".")
     pay := str.Substr(rest, 0, d2)
     // corrupt first payload char
-    c0 := pay[0]
+    c0 := Skink_mem_byte(pay, 0)
     if c0 == 65 {
         pay = str.Concat("B", str.Substr(pay, 1, str.Len(pay) - 1))
     } else {

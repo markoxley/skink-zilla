@@ -10,6 +10,12 @@ import "std/str"
 import "zilla_ctx"
 import "zilla_app"
 
+// Raw byte accessors for binary buffers — string indexing is
+// bounds-checked against strlen, which truncates at the first NUL byte.
+extern fn Skink_mem_byte(ptr: string, idx: int64) -> int
+extern fn Skink_mem_write_byte(ptr: string, idx: int64, val: int)
+
+
 // Config describes an allowed CORS policy.
 pub struct Config {
     Origins:     string // comma/space-separated origins or "*"
