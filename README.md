@@ -12,9 +12,9 @@ scales add markoxley/skink-zilla
 ## Quick start
 
 ```skink
-import "zilla"
-import "zilla_ctx"
-import "zilla_app"
+import "mod/markoxley/skink-zilla"
+import "mod/markoxley/skink-zilla/zilla_ctx"
+import "mod/markoxley/skink-zilla/zilla_app"
 
 fn main() {
     app := zilla.New(8080)
@@ -33,6 +33,8 @@ fn main() {
 ## Middleware
 
 ```skink
+import "mod/markoxley/skink-zilla/zilla_authz"
+
 // app-wide, applied at request time — order is registration order
 zilla_app.UseWeb(&app, fn(next: fn(*zilla_ctx.Ctx)) -> fn(*zilla_ctx.Ctx) {
     return fn(c: *zilla_ctx.Ctx) {
@@ -53,6 +55,8 @@ zilla_app.GroupGet(&api, "/who", handler)
 alg-confusion rejected:
 
 ```skink
+import "mod/markoxley/skink-zilla/zilla_jwt"
+
 tok := zilla_jwt.Sign("{\"sub\":\"u1\"}", secret, int64(3600))
 cl, err := zilla_jwt.Verify(tok, secret)   // cl.Raw / zilla_jwt.Get(&cl,"sub")
 ```
@@ -68,6 +72,8 @@ unauthorized.
 sliding TTL + cookie `skink_sid`:
 
 ```skink
+import "mod/markoxley/skink-zilla/zilla_session"
+
 store := zilla_session.NewStore(int64(3600), "")
 sess := zilla_session.Get(&store, c)
 zilla_session.SSet(&sess, "user", "ada")
@@ -83,6 +89,8 @@ headers); `remote_addr` and `x-forwarded-for` are only fallbacks, so
 behind a trusted proxy supply a named key or override the header:
 
 ```skink
+import "mod/markoxley/skink-zilla/zilla_ratelimit"
+
 lim := zilla_ratelimit.NewLimiter(100, int64(60))
 zilla_app.UseWeb(&app, zilla_ratelimit.Middleware(&lim, ""))
 ```
@@ -92,6 +100,8 @@ zilla_app.UseWeb(&app, zilla_ratelimit.Middleware(&lim, ""))
 middleware, so use `Install` which does both):
 
 ```skink
+import "mod/markoxley/skink-zilla/zilla_cors"
+
 zilla_cors.Install(&app, zilla_cors.DefaultConfig())
 ```
 
@@ -99,6 +109,8 @@ zilla_cors.Install(&app, zilla_cors.DefaultConfig())
 binary-safe (`Part.DataLen` is authoritative, `Data` may hold NULs):
 
 ```skink
+import "mod/markoxley/skink-zilla/zilla_upload"
+
 title := zilla_upload.FormValue(c, "title")
 part, ok := zilla_upload.FormFile(c, "doc")   // part.Filename/.Data
 ```
@@ -108,6 +120,9 @@ part, ok := zilla_upload.FormFile(c, "doc")   // part.Filename/.Data
 handled):
 
 ```skink
+import "mod/markoxley/skink-zilla/zilla_ws"
+import "std/str"
+
 fn hWS(c: *zilla_ctx.Ctx) {
     zilla_ws.Upgrade(c, fn(ws: *zilla_ws.Conn) {
         for {
